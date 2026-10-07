@@ -1,285 +1,115 @@
-# DATUM Gateway
-**Decentralized Alternative Templates for Universal Mining**
-(c) 2024-2026 Bitcoin Ocean, LLC, Jason Hughes, and individual contributors
+# DATUM Gateway, AlphaPool release 3.1
 
-The DATUM Gateway implements lightweight efficient client side decentralized block template creation for true solo mining.
+This branch (`alphapool`) is the source code of AlphaPool's DATUM gateway, release 3.1: the gateway
+build that AlphaPool tests with its pool and that its node installer installs by default. It is the
+DATUM Gateway for BLAKE2b work plus the changes listed below. Everything the release is built from
+is in this repository. The upstream project's own README is kept unchanged in
+[`README.upstream.md`](README.upstream.md).
 
-It reaches out to a local Bitcoin node for block templates, generates and distributes work for mining hardware, and submits solved blocks to the network directly.
+You do not need this build to mine with AlphaPool. You can run any DATUM gateway you choose.
 
-For miners wanting to pool rewards, it facilitates communication with a DATUM-supporting pool in addition to the above.  The pool is responsible for coordinating the block reward split based on work done for the pool by the miner, but does not create work for the miner.
+## What is different from upstream
 
-The work provided by the gateway to mining hardware is generated only from the local node generating templates for the miner. The real miner is always whoever is running the Bitcoin node. With DATUM, that's not the pool. As the protocol is intended solely for mining of decentralized block templates, the DATUM protocol has no mechanisms for the pool providing the information needed to construct work or a block template.
+The release is commit `90f01b76625f5936febdc2389759c462467a750a`. Its base is commit
+`7491a5099dd5d887a027c812f71de63e0d5986a3`, which is part of this branch's history. On top of the
+base, in this order:
 
-Currently the DATUM Gateway supports communication with mining hardware using the Stratum v1 protocol. BLAKE2b and BLAKE2b-Sia miners are supported.  Communication with the Bitcoin node is via RPC and must support GBT ("getblocktemplate").  Finally, communication with the pool is via the DATUM protocol.
+### Upstream pull requests, carried unchanged
 
-The DATUM Gateway only supports mining Bitcoin.  Modifying the code to support non-Bitcoin is not straightforward, as many optimizations and design considerations are tightly tied to Bitcoin-specific restraints for efficiency.
+Each is its author's own commit, cherry-picked onto the base as it stands in the pull request.
 
-## DATUM Protocol
-The DATUM Gateway's communication with the mining pool is via the DATUM Protocol.  This is an encrypted communication link between the DATUM Gateway (client) and the DATUM server (pool side).
+| Commit | Pull request | Author | Change |
+|---|---|---|---|
+| [`e23df65b`](https://github.com/alphaminetech/datum_gateway/commit/e23df65bde78436b0324c8184d4366d98ff05b97) | [CONVOYMining/datum_gateway#9](https://github.com/CONVOYMining/datum_gateway/pull/9) | Jason Sopko | protocol: Take the coinbaser lock before sending the request. A reply that arrived between the request and the wait for it is no longer lost. |
+| [`cfd127b7`](https://github.com/alphaminetech/datum_gateway/commit/cfd127b743dbb8c5100e415099dc440b02c551aa) | [CONVOYMining/datum_gateway#18](https://github.com/CONVOYMining/datum_gateway/pull/18) | Paul Lamb | Bugfix: stratum: Keep the dupe index valid across a table cleanup. With its tests. |
 
-The protocol itself was made from the ground up as a custom protocol.  Its specification is evolving, subject to change, and will be published elsewhere.
+### AlphaPool's changes
 
-The core concepts of the protocol:
+| Commit | Change |
+|---|---|
+| [`2e783c43`](https://github.com/alphaminetech/datum_gateway/commit/2e783c43444f180bd48deab74cde4c5484da5008) | **A gateway identity that survives restarts.** New optional setting `datum.identity_key_path`: the gateway's signing and encryption keys are kept in that file (mode 0600), so the pool sees the same gateway after a restart. Without the setting nothing changes. |
+| [`c24fb32e`](https://github.com/alphaminetech/datum_gateway/commit/c24fb32e7ac94c8bc128fd49cbd4c04797458885) | **Pooled-only mode serves only work that carries the pool's payout assignment.** Details below. |
+| [`90f01b76`](https://github.com/alphaminetech/datum_gateway/commit/90f01b76625f5936febdc2389759c462467a750a) | **Reproducible build recipe** in `contrib/reproducible/`. No change to the gateway's code. |
 
- - Encrypt communications between the Gateway and pool
- - Obfuscate the communications somewhat so a MITM is unable to glean useful or accurate insight into the miner's operation via analysis of the still-ciphered communications.
- - Retrieve proper generation transaction payout splits from the pool for locally constructed templates
- - Submit work to the pool with sufficient data to efficiently validate and accept the work for proper rewards
- - Communicate minimal guardrails and requirements for a valid template to earn pooled rewards
+All five as one diff:
+<https://github.com/alphaminetech/datum_gateway/compare/7491a5099dd5d887a027c812f71de63e0d5986a3...90f01b76625f5936febdc2389759c462467a750a>
 
-With the current version of the protocol, the pool does block validation after coordinating with the miner. This is strictly to ensure miners are not accidentally creating invalid blocks while DATUM is still undergoing testing. In a future version of the protocol, the pool will not be in charge of this function and will be almost completely blinded to the contents of the miner's block template.
+### Pooled-only mode
 
-The protocol is not specific to a pooled reward system, as the Gateway coordinates the appropriate generation transaction with the pool.  However, in the spirit of maximum decentralization, the pool should implement rewarding miners directly from generated payouts, such as with CONVOY's TIDES reward system.
+With `datum.pooled_mining_only` set to `true`:
 
-![DATUM recommended setup - network diagram](doc/DATUM_recommended_setup-network_diagram.svg)
+- A miner is sent a job only after the pool's coinbaser for that job has arrived, the coinbase has
+  been built from it, and the result has been checked. No placeholder work is sent in the meantime;
+  miners keep the work they have.
+- Before a job is published, the coinbase that miners will be served is decoded and compared, output
+  by output, with the assignment it was built from. A job that fails the check is withheld and
+  requested again.
+- An assignment belongs to the DATUM session it was requested on. If that session ended before the
+  job was published, the assignment is discarded and requested again.
+- If no usable coinbaser arrives for 60 seconds, the gateway disconnects its miners once, so that
+  they can fail over, and refuses new connections until a coinbaser is published again.
+- Shares are accepted only for work the gateway served in this mode.
 
-## Requirements
+In every mode that uses a pool:
 
- - 64-bit AMD, Intel, or Apple silicon system. Other systems may work, but at this time it is at your own risk.
- - Linux, macOS, or FreeBSD operating system.
- - Bitcoin full node ([Bitcoin Knots](https://bitcoinknots.org/) recommended) fully synced with the Bitcoin network.
- - Fast storage recommended for the Bitcoin node.
- - Stable internet connection for both the Bitcoin node and Gateway's communication with the pool.
- - CPU powerful enough to run the Bitcoin node without validation delays.
- - Approximately 1GB/RAM, plus 1GB/RAM per 1000 Stratum clients, plus Bitcoin node RAM requirements.
- - Bitcoin mining hardware able to reach the system running the DATUM Gateway.
+- The pool's coinbaser reply is used whole or not at all. A reply with an output past the job's
+  coinbase value, more than 512 outputs, a bad script length or trailing bytes is rejected.
+- The coinbaser fetch waits for the reply to its own request. Waiting for the reply that carries the
+  job's coinbase value is pull request 9 above; this release adds that the reply must have arrived on
+  the same DATUM session and, if the pool echoes the request's token, must carry that token.
+- A pool id that fits in 32 bits is written in the 7-byte form of the coinbase id push.
 
-This list is not extensive, but the main goal is the have a stable system for your Bitcoin node and the Gateway such that your node is processing new incoming blocks and getting templates to the Gateway as quickly as possible.  While this may all work on relatively low end hardware, your mileage may vary.
+Solo mining is unchanged.
 
-No modifications to the Bitcoin node source code is required for the Gateway, as it uses the standard GBT mechanism for template fetch.
+## The release build
 
-The following external libraries are required:
- - libcurl
- - libjansson
- - libmicrohttpd
- - libsodium
+| | Ubuntu 22.04 | Ubuntu 24.04 |
+|---|---|---|
+| Archive | `datum_gateway-r3.1-g90f01b76625f-jammy.tar.gz` | `datum_gateway-r3.1-g90f01b76625f-noble.tar.gz` |
+| sha256 of the archive | `93fe865c5ecedb30886e16ce9ae8943b3a88218f362af078608a9f6caa19d15c` | `85e5131c272418bf1c12a59802aaea58a902f020c6e9a25bbb46c1ff8b3d14ed` |
+| sha256 of `datum_gateway` | `52367405588d48138a972f871624fe9da88df350bec6ebc03d4d83e954f3b043` | `02ca5e7b78c4bd89b97ab385932a6f7baecb0c77bc023f5a57d06d956a336792` |
+| Needs | glibc 2.34 or newer | glibc 2.38 or newer |
 
-## Node Configuration
-Your Bitcoin node must be configured to construct blocks as you desire.  Bitcoin Knots provides many options for configuring your node's policy and is highly recommended.
-
-At this time, you must also reserve some block space for the pool's generation transaction.  The following options are currently recommended:
-
-    blockmaxweight=785000
-
-Note: This reservation requirement will be removed for Bitcoin Knots users in a future version of the DATUM Gateway thanks to support for on-the-fly specification of these metrics by the client in Knots.
-
-To avoid mining stale work, you will need to ensure the DATUM Gateway receives new block notifications from your node. It is suggested you run the DATUM Gateway as the same user as your full node and utilize the following configuration line in your bitcoin.conf:
-
-    blocknotify=killall -USR1 datum_gateway
-
-Ensure you have "killall" installed on your system (*psmisc* package on many OSs).
-
-If the node and Gateway are on different systems, you may need to utilize the "NOTIFY" endpoint on the Gateway's dashboard/API instead.
-
-Finally, the Gateway must have RPC access to your node, and you must add an RPC user to your configuration to facilitate this, as well as ensuring the service running the Gateway is whitelisted for RPC access (if not on the same machine).
-
-Some additional recommendations:
-
-    maxmempool=1000
-
-As a true miner, you'll most likely want as many valid transactions as possible in your mempool which meet your node's policies.
-
-## Installation
-Install and fully sync your Bitcoin full node. Instructions for this are beyond the scope of this document.
-
-Configure your node to create block templates as you desire. Be sure to reserve some space for the generation transaction, otherwise your work will not be able to fit a reward split.  See node configuration recommendations above.
-
-Install the required libraries and development packages for dependencies: cmake, pkgconf, libcurl, jansson, libsodium, and libmicrohttpd. You may also need psmisc for your node to send blocknotify signals to the DATUM Gateway.
-
-For Debian/Ubuntu:
-
-    sudo apt install cmake pkgconf libcurl4-openssl-dev libjansson-dev libsodium-dev libmicrohttpd-dev psmisc
-
-For Fedora/Amazon Linux:
-
-    sudo dnf install cmake pkgconf libcurl-devel jansson-devel libsodium-devel libmicrohttpd-devel psmisc
-
-For Alma Linux:
-
-    sudo dnf install epel-release dnf-plugins-core
-    sudo dnf config-manager --set-enabled crb
-    sudo dnf install cmake pkgconf libcurl-devel jansson-devel libsodium-devel libmicrohttpd-devel psmisc
-
-For Oracle Linux:
-
-    sudo dnf install epel-release dnf-plugins-core
-    sudo dnf config-manager --set-enabled ol9_codeready_builder
-    sudo dnf install cmake pkgconf libcurl-devel jansson-devel libsodium-devel libmicrohttpd-devel psmisc
-
-For Alpine (also needs a standalone argp library):
-
-    sudo apk add build-base cmake pkgconf argp-standalone curl-dev jansson-dev libsodium-dev libmicrohttpd-dev psmisc
-
-For Arch:
-
-    sudo pacman -Syu base-devel cmake pkgconf curl jansson libsodium libmicrohttpd psmisc
-
-For Clear Linux:
-
-    sudo swupd bundle-add c-basic cmake pkgconf devpkg-curl devpkg-jansson devpkg-libsodium devpkg-libmicrohttpd psmisc
-
-For FreeBSD:
-
-    sudo pkg install cmake pkgconf curl jansson libsodium libmicrohttpd argp-standalone libepoll-shim
-
-For macOS with Homebrew:
-
-    brew install cmake pkgconf curl jansson libsodium libmicrohttpd argp-standalone epoll-shim
-
-Compile DATUM by running:
-
-    cmake . && make
-
-## Usage
-
-Run the datum_gateway executable with the -? flag for detailed configuration information, descriptions, and required options.  Then construct a configuration file (defaults to "datum_gateway_config.json" in the current working directory). Be sure to also set your coinbase tags.  The primary tag setting is unused in pooled mining, however the secondary tag is intended to show on things like block explorers when you mine a block.
-
-There is an [example configuration file included in the doc/ directory](doc/example_datum_gateway_config.json) you may wish to use as a template.
-Note that the API/web admin password is also used for preventing CSRF attacks, so it is crucial you set it to something reasonably secure (or disable the API/web interface entirely).
-
-You should review the [documentation on usernames](doc/usernames.md) next.
-Once you have everything running, you can point miners at the Gateway.
-
-## Docker
-
-The DATUM Gateway is also available as a Docker image.
-
-
-### Building the Docker Image
-
-To build the DATUM Gateway Docker image:
-
-```bash
-# From the root of the repository
-docker build -t datum_gateway .
-```
-
-### Running the Container
-
-To run the DATUM Gateway container:
-
-```bash
-# Run with default configuration
-docker run -p 23334:23334 -p 7152:7152 --name datum-gateway datum_gateway
-```
-
-The container expects a configuration file at `/app/config/config.json`. Mount a volume to this path to use your own configuration:
-
-```bash
-docker run -v /path/to/your/config/directory:/app/config -p 23334:23334 -p 7152:7152 datum_gateway
-```
-
-You will need to disable the notify fallback in your configuration file if you are using Docker. And in bitcoin.conf, you will need to set the following:
-
-```bash
-blocknotify=wget -q -O /dev/null http://datum-gateway:7152/NOTIFY
-```
-
-### Connecting to a Bitcoin Node
-
-When running the DATUM Gateway in Docker, you need to configure it to connect to your Bitcoin node. The connection method depends on where your Bitcoin node is running:
-
-#### 1. Bitcoin Node Running in Docker (Same Network)
-
-If your Bitcoin node is also running in a Docker container on the same network, use the container name as the hostname:
-
-```json
-{
-  "rpc_host": "bitcoin-node",
-  "rpc_port": 8332,
-  "rpc_user": "your_rpc_user",
-  "rpc_pass": "your_rpc_password"
-}
-```
-
-In your `bitcoin.conf`, set the blocknotify to use the DATUM Gateway container name:
+The version this build sends to the pool in the DATUM handshake is
 
 ```
-blocknotify=wget -q -O /dev/null http://datum-gateway:7152/NOTIFY
+v0.4.1-beta/90f01b76625f5936febdc2389759c462467a750a
 ```
 
-#### 2. Bitcoin Node Running on Host System
+that is, the protocol version and the full hash of the commit it was built from.
 
-If your Bitcoin node is running directly on the host system or in a container that binds to host ports, you have two options:
+## Rebuild it and get the same bytes
 
-**Option A: Using host.docker.internal (recommended)**
-```json
-{
-  "rpc_host": "host.docker.internal",
-  "rpc_port": 8332,
-  "rpc_user": "your_rpc_user",
-  "rpc_pass": "your_rpc_password"
-}
+```
+git clone https://github.com/alphaminetech/datum_gateway.git && cd datum_gateway
+git checkout 90f01b76625f5936febdc2389759c462467a750a
+contrib/reproducible/build.sh jammy out    # Ubuntu 22.04
+contrib/reproducible/build.sh noble out    # Ubuntu 24.04
+sha256sum out/*.tar.gz
 ```
 
-**Option B: Using host networking mode**
-Run the DATUM Gateway container with `--network host`:
+You need Docker on an x86-64 machine. The recipe pins the container image by digest, takes every
+package from the Ubuntu archive at one fixed time stamp, builds in a fixed directory and packs a
+deterministic archive, so the two sha256 values above come out again. How it works and what
+exactly is fixed: [`contrib/reproducible/README.md`](contrib/reproducible/README.md).
 
-```bash
-docker run --network host -v /path/to/config:/app/config datum_gateway
+## Build it your own way
+
+```
+sudo apt install build-essential cmake pkg-config git libcurl4-openssl-dev libjansson-dev libmicrohttpd-dev libsodium-dev
+git clone --no-tags https://github.com/alphaminetech/datum_gateway.git && cd datum_gateway
+git checkout 90f01b76625f5936febdc2389759c462467a750a
+cmake . && make
+./datum_gateway --test        # the gateway's own test suite
 ```
 
-Then configure using localhost:
-```json
-{
-  "rpc_host": "localhost",
-  "rpc_port": 8332,
-  "rpc_user": "your_rpc_user",
-  "rpc_pass": "your_rpc_password"
-}
-```
+Such a build sends the same version string. Its bytes differ from the release build when the
+compiler, the libraries or the directory differ. (`--no-tags` matters: the build system adds
+`(<tag>)` to the version when an annotated tag points at the commit that is built.)
 
-For blocknotify in `bitcoin.conf` when using host networking:
-```
-blocknotify=wget -q -O /dev/null http://localhost:7152/NOTIFY
-```
+Later commits on this branch change documentation only. The release stays the commit named above.
 
-#### 3. Bitcoin Node on Remote System
+## Licence
 
-If your Bitcoin node is running on a different machine, use the hostname or IP address:
-
-```json
-{
-  "rpc_host": "192.168.1.100",
-  "rpc_port": 8332,
-  "rpc_user": "your_rpc_user",
-  "rpc_pass": "your_rpc_password"
-}
-```
-
-In your remote Bitcoin node's `bitcoin.conf`:
-```
-blocknotify=wget -q -O /dev/null http://datum-gateway-host-ip:7152/NOTIFY
-```
-
-**Important Notes:**
-- Ensure your Bitcoin node's RPC is configured to accept connections from the DATUM Gateway
-- For remote connections, you may need to configure `rpcbind` and `rpcallowip` in your `bitcoin.conf`
-- Always use strong RPC credentials and consider network security when exposing RPC endpoints
-- Remember to disable the notify fallback in your DATUM Gateway configuration when using Docker
-
-## Template/Share Requirements for Pooled Mining
-
- - Must be a valid block and conform to current Bitcoin consensus rules
- - Submitted work must be for the current latest block height, valid time, etc
- - Must include generation transaction outputs provided by the pool in the order provided
- - Must include the primary coinbase tag as provided by the pool
- - Must include the unique identifier provided by the pool
- - Work must include the work target and meet/exceed that target
- - Any additional requirements by pool documentation
-
-## Notes/Known Issues/Limitations
-
-- By default, if the connection with the pool is lost and fails to reconnect, the Gateway will disconnect all stratum clients. This way miners can use their built-in failover and switch to non-DATUM mining, or an alternate/backup Gateway.
-- Accepted/rejected share counts on mining hardware may not perfectly match with the pool. The delta may vary depending on the Gateway's configuration. This is because shares are first accepted or rejected as valid for your local template based on your local node, and then again accepted or rejected based on the pool's requirements, latency to the pool (stale work), latency between your node and the network (stale work), etc.  Stratum v1 has no mechanism to report back to the miner that previously accepted work is now rejected, and it doesn't make sense to wait for the pool before responding, either.
-- **Share statistics**: The status page always shows local shares accepted/rejected by this Gateway. When a pool host is configured, it also shows shares accepted/rejected by the DATUM pool. Those two series are tracked separately and can differ (see above). When no pool host is configured, pool share counts are shown as N/A.
-
-**Most importantly**, please note that this is currently a public **BETA** release. While best efforts have been made to ensure this software is as stable and as useful as possible, you may still encounter issues.
-
-This software is likely to undergo rapid development and revisions up until a v1.0 stable release. Some of these revisions may include changes, such as protocol changes, that require upgrading to the latest version with short or even no notice in order to continue using the software with a DATUM pool. Be sure to watch for important updates!
-
-Be sure you have failover settings on your miners. As a best practice, when mining on a DATUM pool, set your miner's failover to use that pool's Stratum endpoint.
-
-## License
-
-The DATUM Gateway (including the DATUM Protocol) is free open source software and released under the terms of the MIT license.  See LICENSE.
+MIT, see [`LICENSE`](LICENSE). The DATUM Gateway is the work of its upstream authors and
+contributors; AlphaPool's changes are published under the same licence.
