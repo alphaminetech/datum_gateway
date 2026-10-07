@@ -183,6 +183,8 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 		.required = false, .ptr = &datum_config.datum_pool_port, .default_int = 28915 },
 	{ .var_type = DATUM_CONF_STRING, 	.category = "datum", 		.name = "pool_pubkey",					.description = "Public key of the DATUM server for initiating encrypted connection. Get from secure location, or set to empty to auto-fetch.",
 		.required = false, .ptr = datum_config.datum_pool_pubkey,		.default_string[0] = "dbb11fa0c2b5403e4f798fa6071bb97e6079d219598366032fdf2ae01962b13c5e66e2be7d6b008f0b2603f3e6f6fc64768fa786c8129c46d3e30a5867734b62", .max_string_len = sizeof(datum_config.datum_pool_pubkey) },
+	{ .var_type = DATUM_CONF_STRING, 	.category = "datum", 		.name = "identity_key_path",			.description = "Path to a file that keeps this gateway's DATUM identity keys across restarts (created on first start; leave empty for a fresh identity on every start)",
+		.required = false, .ptr = datum_config.datum_identity_key_path,	.default_string[0] = "", .max_string_len = sizeof(datum_config.datum_identity_key_path) },
 	{ .var_type = DATUM_CONF_INT, 		.category = "datum", 		.name = "migration_max_seconds",		.description = "Maximum time to remain away from the configured DATUM server after a server-requested migration (0 disables migration)",
 		.example_default = true,
 		.required = false, .ptr = &datum_config.datum_pool_migration_max_seconds, .default_int = 86400 },

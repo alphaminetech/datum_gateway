@@ -67,6 +67,14 @@
 
 #define MAX_DATUM_CLIENT_EVENTS 32
 
+// On-disk layout of datum.identity_key_path: "DATUMID1", one version byte (1),
+// then the raw ed25519 secret key, ed25519 public key, x25519 secret key and
+// x25519 public key. Any other length, magic or version is rejected.
+#define DATUM_IDENTITY_KEYFILE_MAGIC "DATUMID1"
+#define DATUM_IDENTITY_KEYFILE_MAGIC_LEN 8
+#define DATUM_IDENTITY_KEYFILE_VERSION 1
+#define DATUM_IDENTITY_KEYFILE_SIZE (DATUM_IDENTITY_KEYFILE_MAGIC_LEN + 1 + crypto_sign_SECRETKEYBYTES + crypto_sign_PUBLICKEYBYTES + crypto_box_SECRETKEYBYTES + crypto_box_PUBLICKEYBYTES)
+
 // Header is only XOR'd with a rotating key.  This is NOT 100% secure, and makes the cmd# and length of the handshake message decipherable.
 // This is not an issue for security, however, as all following packets use a negotiated XOR key.
 // It's likely possible to brute force the XOR key to break packets down into individual commands, but the contents and nature of the
@@ -138,6 +146,10 @@ typedef struct {
 
 int datum_protocol_init(void);
 int datum_encrypt_generate_keys(DATUM_ENC_KEYS *keys);
+// Byte-level key file I/O only (no key generation or validation). Both return
+// 0, or -1 with errno set (EBADMSG for a file of the wrong shape).
+int datum_identity_keyfile_write(const char *path, const DATUM_ENC_KEYS *k);
+int datum_identity_keyfile_read(const char *path, DATUM_ENC_KEYS *k);
 bool datum_protocol_is_active(void);
 bool datum_protocol_abw_required(void);
 void datum_increment_session_nonce(void *s);

@@ -168,6 +168,7 @@ typedef struct {
 	bool datum_always_pay_self;
 	bool datum_pooled_mining_only;
 	char datum_pool_pubkey[1024];
+	char datum_identity_key_path[1024];
 	int datum_protocol_global_timeout;
 	uint64_t datum_protocol_global_timeout_ms;
 	

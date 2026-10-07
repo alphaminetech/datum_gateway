@@ -34,9 +34,12 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "datum_conf.h"
@@ -828,6 +831,126 @@ static void datum_pow_recycled_protocol_job_test(void) {
 	free(jobs);
 }
 
+// Replaces whatever is at path with exactly these bytes, to hand the reader files of the
+// wrong shape.
+static bool datum_identity_test_write_raw(const char *path, const unsigned char *data, size_t len) {
+	int fd;
+	ssize_t w;
+	
+	unlink(path);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) return false;
+	w = write(fd, data, len);
+	close(fd);
+	return w == (ssize_t)len;
+}
+
+static void datum_identity_keyfile_tests(void) {
+	char dir[] = "/tmp/datum_identity_test_XXXXXX";
+	char path[sizeof(dir) + 16];
+	char tmp_path[sizeof(path) + 4];
+	char link_path[sizeof(dir) + 16];
+	unsigned char raw[DATUM_IDENTITY_KEYFILE_SIZE + 1];
+	DATUM_ENC_KEYS k, r;
+	struct stat st;
+	size_t i;
+	int fd;
+
+	if (!datum_test(mkdtemp(dir) != NULL)) return;
+	snprintf(path, sizeof(path), "%s/identity.key", dir);
+	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+	snprintf(link_path, sizeof(link_path), "%s/identity.lnk", dir);
+	
+	// Arbitrary key material: the helpers move bytes and must not care whether it is valid
+	memset(&k, 0, sizeof(k));
+	for (i = 0; i < sizeof(k.sk_ed25519); ++i) k.sk_ed25519[i] = (unsigned char)i;
+	for (i = 0; i < sizeof(k.pk_ed25519); ++i) k.pk_ed25519[i] = (unsigned char)(0x40 + i);
+	for (i = 0; i < sizeof(k.sk_x25519); ++i) k.sk_x25519[i] = (unsigned char)(0x80 + i);
+	for (i = 0; i < sizeof(k.pk_x25519); ++i) k.pk_x25519[i] = (unsigned char)(0xc0 + i);
+	
+	// A missing file is a clean -1
+	memset(&r, 0xAA, sizeof(r));
+	errno = 0;
+	datum_test(datum_identity_keyfile_read(path, &r) == -1 && errno == ENOENT);
+	datum_test(r.sk_ed25519[0] == 0xAA);
+	
+	// Write, then read back: same bytes, mode 0600, temp file renamed away
+	datum_test(datum_identity_keyfile_write(path, &k) == 0);
+	datum_test(access(tmp_path, F_OK) != 0);
+	datum_test(lstat(path, &st) == 0);
+	datum_test(S_ISREG(st.st_mode));
+	datum_test((st.st_mode & 07777) == 0600);
+	datum_test(st.st_size == 169); // 8 magic + 1 version + 64 + 32 + 32 + 32
+	memset(&r, 0xAA, sizeof(r));
+	datum_test(datum_identity_keyfile_read(path, &r) == 0);
+	datum_test(!memcmp(r.sk_ed25519, k.sk_ed25519, sizeof(k.sk_ed25519)));
+	datum_test(!memcmp(r.pk_ed25519, k.pk_ed25519, sizeof(k.pk_ed25519)));
+	datum_test(!memcmp(r.sk_x25519, k.sk_x25519, sizeof(k.sk_x25519)));
+	datum_test(!memcmp(r.pk_x25519, k.pk_x25519, sizeof(k.pk_x25519)));
+	datum_test(!r.is_remote);
+	
+	// The bytes on disk are the documented layout: magic, version, sk_ed, pk_ed, sk_x, pk_x
+	memset(raw, 0, sizeof(raw));
+	fd = open(path, O_RDONLY);
+	datum_test(fd >= 0);
+	if (fd >= 0) {
+		datum_test(read(fd, raw, sizeof(raw)) == DATUM_IDENTITY_KEYFILE_SIZE);
+		close(fd);
+	}
+	datum_test(!memcmp(raw, "DATUMID1", 8));
+	datum_test(raw[8] == 1);
+	datum_test(!memcmp(raw + 9, k.sk_ed25519, 64));
+	datum_test(!memcmp(raw + 73, k.pk_ed25519, 32));
+	datum_test(!memcmp(raw + 105, k.sk_x25519, 32));
+	datum_test(!memcmp(raw + 137, k.pk_x25519, 32));
+	
+	// A leftover temp file is never clobbered, and the real file is left as it was
+	fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	datum_test(fd >= 0);
+	if (fd >= 0) close(fd);
+	memset(&r, 0, sizeof(r));
+	errno = 0;
+	datum_test(datum_identity_keyfile_write(path, &r) == -1 && errno == EEXIST);
+	datum_test(access(tmp_path, F_OK) == 0);
+	datum_test(unlink(tmp_path) == 0);
+	datum_test(datum_identity_keyfile_read(path, &r) == 0);
+	datum_test(!memcmp(r.sk_ed25519, k.sk_ed25519, sizeof(k.sk_ed25519)));
+	
+	// A symlink is rejected even when it points at a valid key file, and nothing is copied out
+	datum_test(symlink(path, link_path) == 0);
+	memset(&r, 0xAA, sizeof(r));
+	datum_test(datum_identity_keyfile_read(link_path, &r) == -1);
+	datum_test(r.sk_ed25519[0] == 0xAA);
+	datum_test(unlink(link_path) == 0);
+	
+	// Wrong shapes are rejected: short, long, bad magic, wrong version...
+	datum_test(datum_identity_test_write_raw(path, raw, DATUM_IDENTITY_KEYFILE_SIZE - 1));
+	errno = 0;
+	datum_test(datum_identity_keyfile_read(path, &r) == -1 && errno == EBADMSG);
+	datum_test(datum_identity_test_write_raw(path, raw, DATUM_IDENTITY_KEYFILE_SIZE + 1));
+	datum_test(datum_identity_keyfile_read(path, &r) == -1);
+	raw[0] ^= 0x20; // "dATUMID1"
+	datum_test(datum_identity_test_write_raw(path, raw, DATUM_IDENTITY_KEYFILE_SIZE));
+	datum_test(datum_identity_keyfile_read(path, &r) == -1);
+	raw[0] ^= 0x20;
+	raw[8] = 2;
+	datum_test(datum_identity_test_write_raw(path, raw, DATUM_IDENTITY_KEYFILE_SIZE));
+	datum_test(datum_identity_keyfile_read(path, &r) == -1);
+	raw[8] = 1;
+	// ...and the same bytes in the right shape are accepted, so the rejections above mean something
+	datum_test(datum_identity_test_write_raw(path, raw, DATUM_IDENTITY_KEYFILE_SIZE));
+	memset(&r, 0xAA, sizeof(r));
+	datum_test(datum_identity_keyfile_read(path, &r) == 0);
+	datum_test(!memcmp(r.pk_x25519, k.pk_x25519, sizeof(k.pk_x25519)));
+	
+	// A directory at the path is not a key file
+	datum_test(datum_identity_keyfile_read(dir, &r) == -1);
+	
+	unlink(path);
+	unlink(tmp_path);
+	rmdir(dir);
+}
+
 void datum_protocol_tests(void) {
 	datum_protocol_config_v3_tests();
 	datum_protocol_migration_tests();
@@ -836,4 +959,5 @@ void datum_protocol_tests(void) {
 	datum_protocol_abw_cache_tests();
 	datum_pow_response_large_difficulty_test();
 	datum_pow_recycled_protocol_job_test();
+	datum_identity_keyfile_tests();
 }

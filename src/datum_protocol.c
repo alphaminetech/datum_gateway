@@ -55,6 +55,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -66,6 +67,7 @@
 #include <netinet/tcp.h>
 #include <netinet/in.h>
 #include <inttypes.h>
+#include <limits.h>
 
 #include "datum_utils.h"
 #include "datum_protocol.h"
@@ -3383,6 +3385,218 @@ void datum_protocol_start_connector(void) {
 	}
 }
 
+int datum_identity_keyfile_write(const char *path, const DATUM_ENC_KEYS *k) {
+	unsigned char buf[DATUM_IDENTITY_KEYFILE_SIZE];
+	char tmp_path[PATH_MAX];
+	size_t done = 0;
+	ssize_t w;
+	int fd, i, saved_errno;
+	
+	if ((!path[0]) || (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) >= (int)sizeof(tmp_path))) {
+		errno = EINVAL;
+		return -1;
+	}
+	
+	memcpy(buf, DATUM_IDENTITY_KEYFILE_MAGIC, DATUM_IDENTITY_KEYFILE_MAGIC_LEN); i = DATUM_IDENTITY_KEYFILE_MAGIC_LEN;
+	buf[i++] = DATUM_IDENTITY_KEYFILE_VERSION;
+	memcpy(&buf[i], k->sk_ed25519, crypto_sign_SECRETKEYBYTES); i += crypto_sign_SECRETKEYBYTES;
+	memcpy(&buf[i], k->pk_ed25519, crypto_sign_PUBLICKEYBYTES); i += crypto_sign_PUBLICKEYBYTES;
+	memcpy(&buf[i], k->sk_x25519, crypto_box_SECRETKEYBYTES); i += crypto_box_SECRETKEYBYTES;
+	memcpy(&buf[i], k->pk_x25519, crypto_box_PUBLICKEYBYTES);
+	
+	// Written to a temp file in the same directory and renamed into place, so the key file
+	// is either complete or absent. O_EXCL|O_NOFOLLOW: never clobber a leftover temp file
+	// or follow a symlink planted there; a human must look.
+	fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+	if (fd < 0) {
+		sodium_memzero(buf, sizeof(buf));
+		return -1;
+	}
+	
+	while (done < sizeof(buf)) {
+		w = write(fd, &buf[done], sizeof(buf) - done);
+		if (w < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (w == 0) {
+			errno = EIO;
+			break;
+		}
+		done += (size_t)w;
+	}
+	sodium_memzero(buf, sizeof(buf));
+	
+	if ((done != sizeof(buf)) || (fsync(fd) != 0)) {
+		saved_errno = errno;
+		close(fd);
+		goto fail;
+	}
+	if (close(fd) != 0) {
+		saved_errno = errno;
+		goto fail;
+	}
+	if (rename(tmp_path, path) != 0) {
+		saved_errno = errno;
+		goto fail;
+	}
+	
+	return 0;
+	
+fail:
+	unlink(tmp_path);
+	errno = saved_errno;
+	return -1;
+}
+
+int datum_identity_keyfile_read(const char *path, DATUM_ENC_KEYS *k) {
+	unsigned char buf[DATUM_IDENTITY_KEYFILE_SIZE + 1]; // one spare byte, so an oversized file is detected
+	struct stat st;
+	size_t got = 0;
+	ssize_t r = 0;
+	int fd, i, saved_errno;
+	
+	// O_NOFOLLOW: the key file itself must be a regular file, never a symlink
+	fd = open(path, O_RDONLY | O_NOFOLLOW);
+	if (fd < 0) return -1;
+	
+	if (fstat(fd, &st) != 0) {
+		saved_errno = errno;
+		close(fd);
+		errno = saved_errno;
+		return -1;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		close(fd);
+		errno = EINVAL;
+		return -1;
+	}
+	
+	while (got < sizeof(buf)) {
+		r = read(fd, &buf[got], sizeof(buf) - got);
+		if (r < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (r == 0) break; // EOF
+		got += (size_t)r;
+	}
+	saved_errno = errno;
+	close(fd);
+	
+	if (r < 0) {
+		sodium_memzero(buf, sizeof(buf));
+		errno = saved_errno;
+		return -1;
+	}
+	
+	if ((got != DATUM_IDENTITY_KEYFILE_SIZE) || (memcmp(buf, DATUM_IDENTITY_KEYFILE_MAGIC, DATUM_IDENTITY_KEYFILE_MAGIC_LEN) != 0) || (buf[DATUM_IDENTITY_KEYFILE_MAGIC_LEN] != DATUM_IDENTITY_KEYFILE_VERSION)) {
+		sodium_memzero(buf, sizeof(buf));
+		errno = EBADMSG;
+		return -1;
+	}
+	
+	// nothing is copied out until the whole file has been accepted
+	i = DATUM_IDENTITY_KEYFILE_MAGIC_LEN + 1;
+	memcpy(k->sk_ed25519, &buf[i], crypto_sign_SECRETKEYBYTES); i += crypto_sign_SECRETKEYBYTES;
+	memcpy(k->pk_ed25519, &buf[i], crypto_sign_PUBLICKEYBYTES); i += crypto_sign_PUBLICKEYBYTES;
+	memcpy(k->sk_x25519, &buf[i], crypto_box_SECRETKEYBYTES); i += crypto_box_SECRETKEYBYTES;
+	memcpy(k->pk_x25519, &buf[i], crypto_box_PUBLICKEYBYTES);
+	k->is_remote = false;
+	sodium_memzero(buf, sizeof(buf));
+	
+	return 0;
+}
+
+// The public keys in a loaded key file must be the ones its secret keys derive. This needs
+// libsodium, so it lives here with the caller rather than in the byte-only file helpers.
+static bool datum_identity_keys_consistent(const DATUM_ENC_KEYS *k) {
+	unsigned char seed[crypto_sign_SEEDBYTES];
+	unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+	unsigned char sk[crypto_sign_SECRETKEYBYTES];
+	unsigned char pk_x[crypto_box_PUBLICKEYBYTES];
+	bool ok = true;
+	
+	// ed25519: the public key embedded in the secret key must be the stored one...
+	if (crypto_sign_ed25519_sk_to_pk(pk, k->sk_ed25519) != 0) return false;
+	if (sodium_memcmp(pk, k->pk_ed25519, crypto_sign_PUBLICKEYBYTES) != 0) ok = false;
+	
+	// ...and the seed half must really derive that key pair (catches a corrupted seed too)
+	if (crypto_sign_ed25519_sk_to_seed(seed, k->sk_ed25519) != 0) return false;
+	if (crypto_sign_seed_keypair(pk, sk, seed) != 0) return false;
+	if (sodium_memcmp(pk, k->pk_ed25519, crypto_sign_PUBLICKEYBYTES) != 0) ok = false;
+	if (sodium_memcmp(sk, k->sk_ed25519, crypto_sign_SECRETKEYBYTES) != 0) ok = false;
+	sodium_memzero(seed, sizeof(seed));
+	sodium_memzero(sk, sizeof(sk));
+	
+	// x25519: crypto_box_keypair() derives pk = base * sk, so the stored pk must match that
+	if (crypto_scalarmult_base(pk_x, k->sk_x25519) != 0) return false;
+	if (sodium_memcmp(pk_x, k->pk_x25519, crypto_box_PUBLICKEYBYTES) != 0) ok = false;
+	
+	return ok;
+}
+
+// first 8 bytes of the signing public key as hex, for log lines. s must hold 17 chars.
+static void datum_identity_pubkey_prefix(const DATUM_ENC_KEYS *keys, char *s) {
+	int i;
+	
+	for(i=0;i<8;i++) {
+		uchar_to_hex(&s[i<<1], keys->pk_ed25519[i]);
+	}
+	s[i<<1] = 0;
+}
+
+// Stable gateway identity: with datum.identity_key_path set, the signing and encryption
+// key pairs are loaded from that file, or generated and saved there on first start, so the
+// pool sees the same gateway across restarts. A file that exists but cannot be used is
+// reported and left alone; this run then mines on fresh ephemeral keys, as before.
+// Returns 0 with keys filled in, or -1 if no keys could be generated at all.
+static int datum_protocol_identity_init(DATUM_ENC_KEYS *keys, const char *path) {
+	char s[17];
+	struct stat st;
+	int i;
+	
+	if (!path[0]) {
+		// no path configured: fresh ephemeral keys on every start (the previous behaviour)
+		return datum_encrypt_generate_keys(keys);
+	}
+	
+	if (lstat(path, &st) == 0) {
+		// something is there. use it if we can, and never overwrite it if we can't.
+		if (!S_ISREG(st.st_mode)) {
+			// symlink, directory, FIFO, ...: not ours, and never opened (a FIFO would block)
+			DLOG_ERROR("Identity key file %s exists but is not a regular file. NOT touching it; using a fresh ephemeral identity for this run. Move it aside.", path);
+		} else if (datum_identity_keyfile_read(path, keys) != 0) {
+			DLOG_ERROR("Identity key file %s exists but could not be used (%s). NOT overwriting it; using a fresh ephemeral identity for this run. Fix the file or move it aside.", path, strerror(errno));
+		} else if (!datum_identity_keys_consistent(keys)) {
+			DLOG_ERROR("Identity key file %s is invalid: its public keys do not match its secret keys. NOT overwriting it; using a fresh ephemeral identity for this run. Fix the file or move it aside.", path);
+		} else {
+			datum_identity_pubkey_prefix(keys, s);
+			DLOG_INFO("Loaded DATUM identity from %s (signing pubkey %s...)", path, s);
+			return 0;
+		}
+		return datum_encrypt_generate_keys(keys);
+	}
+	
+	if (errno != ENOENT) {
+		DLOG_ERROR("Could not check identity key file %s (%s). Using a fresh ephemeral identity for this run.", path, strerror(errno));
+		return datum_encrypt_generate_keys(keys);
+	}
+	
+	// nothing there yet: generate as before, then keep it for next time
+	i = datum_encrypt_generate_keys(keys);
+	if (i != 0) return i;
+	
+	if (datum_identity_keyfile_write(path, keys) != 0) {
+		DLOG_ERROR("Could not save the new DATUM identity to %s (%s). Using it as an ephemeral identity for this run; check that the directory exists and is writable by this user.", path, strerror(errno));
+		return 0;
+	}
+	
+	datum_identity_pubkey_prefix(keys, s);
+	DLOG_INFO("Created a new DATUM identity and saved it to %s (signing pubkey %s...)", path, s);
+	return 0;
+}
+
 int datum_protocol_init(void) {
 	if (datum_config.datum_pool_host[0] == 0) {
 		DLOG_WARN("****************************************************");
@@ -3404,7 +3618,7 @@ int datum_protocol_init(void) {
 	memset(&pool_keys, 0, sizeof(DATUM_ENC_KEYS));
 	memset(&session_datum_keys, 0, sizeof(DATUM_ENC_KEYS));
 	
-	if (datum_encrypt_generate_keys(&local_datum_keys) != 0) {
+	if (datum_protocol_identity_init(&local_datum_keys, datum_config.datum_identity_key_path) != 0) {
 		DLOG_FATAL("Could not generate our keys");
 		return -1;
 	}
