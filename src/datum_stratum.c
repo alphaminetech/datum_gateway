@@ -45,6 +45,7 @@
 #include <errno.h>
 #include <jansson.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <sys/resource.h>
 
 #include "datum_gateway.h"
@@ -79,6 +80,9 @@ uint64_t stratum_latest_empty_sent_count = 0;
 
 pthread_rwlock_t need_coinbaser_rwlocks[MAX_STRATUM_JOBS];
 bool need_coinbaser_rwlocks_init_done = false;
+
+// creation order of stratum jobs (T_DATUM_STRATUM_JOB.job_seq); 0 is never used
+static atomic_uint_fast64_t stratum_job_seq_next = 0;
 
 uint64_t stratum_client_accepted_share_count = 0;
 uint64_t stratum_client_accepted_share_diff = 0;
@@ -402,26 +406,131 @@ int datum_stratum_v1_get_thread_subscriber_count(T_DATUM_THREAD_DATA *my) {
 	return c;
 }
 
+// Pooled-only coinbaser outage tracker (AlphaPool release 3).
+// Timing the fail-close from the age of the CURRENT job is not enough: a normal
+// template replacement (every bitcoind_work_update_seconds, 40 s by default)
+// makes a fresh job, so a pool that answered no usable coinbaser for minutes
+// would never trip it. The outage is gateway-wide: it starts the first time
+// the current work lacks a usable published coinbaser and ends only when a
+// coinbaser passes the publication check (datum_coinbaser_job_step). Written by
+// the coinbaser thread and the stratum threads, read by the listener; a mutex
+// keeps "start unless already published" atomic against a publication.
+static pthread_mutex_t datum_pooled_outage_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t datum_pooled_outage_since_ms = 0;   // monotonic ms, 0 = no outage
+static uint64_t datum_pooled_outage_published_seq = 0; // newest job_seq with a validated publication
+static bool datum_pooled_outage_kicked = false;     // miners already dropped for this outage
+
+void datum_pooled_outage_note_unready(uint64_t job_seq, uint64_t now_mono_ms) {
+	pthread_mutex_lock(&datum_pooled_outage_lock);
+	// A job no newer than the last published one is superseded work (a stratum
+	// thread can still be looking at it): it must not start an outage.
+	if ((job_seq > datum_pooled_outage_published_seq) && (!datum_pooled_outage_since_ms)) {
+		datum_pooled_outage_since_ms = now_mono_ms ? now_mono_ms : 1;
+	}
+	pthread_mutex_unlock(&datum_pooled_outage_lock);
+}
+
+void datum_pooled_outage_note_published(uint64_t job_seq) {
+	pthread_mutex_lock(&datum_pooled_outage_lock);
+	if (job_seq > datum_pooled_outage_published_seq) {
+		datum_pooled_outage_published_seq = job_seq;
+	}
+	datum_pooled_outage_since_ms = 0;
+	datum_pooled_outage_kicked = false; // re-arm: a later outage kicks again
+	pthread_mutex_unlock(&datum_pooled_outage_lock);
+}
+
+static bool datum_pooled_outage_past_bound_locked(uint64_t now_mono_ms) {
+	return datum_pooled_outage_since_ms && (now_mono_ms > datum_pooled_outage_since_ms) &&
+		((now_mono_ms - datum_pooled_outage_since_ms) > DATUM_POOLED_ONLY_COINBASER_FAILCLOSE_MS);
+}
+
+bool datum_pooled_outage_kick_due(uint64_t now_mono_ms, uint64_t *outage_ms) {
+	bool due = false;
+	pthread_mutex_lock(&datum_pooled_outage_lock);
+	if (datum_pooled_outage_past_bound_locked(now_mono_ms) && !datum_pooled_outage_kicked) {
+		datum_pooled_outage_kicked = true;
+		due = true;
+		if (outage_ms) *outage_ms = now_mono_ms - datum_pooled_outage_since_ms;
+	}
+	pthread_mutex_unlock(&datum_pooled_outage_lock);
+	return due;
+}
+
+bool datum_pooled_outage_reject_new_miners(uint64_t now_mono_ms) {
+	bool reject;
+	pthread_mutex_lock(&datum_pooled_outage_lock);
+	reject = datum_pooled_outage_past_bound_locked(now_mono_ms);
+	pthread_mutex_unlock(&datum_pooled_outage_lock);
+	return reject;
+}
+
+int datum_pooled_only_new_miner_refusal(bool pooled_only, bool link_active, uint64_t now_mono_ms) {
+	if (!pooled_only) return DATUM_POOLED_REFUSE_NONE;
+	if (!link_active) return DATUM_POOLED_REFUSE_LINK_DOWN;
+	if (datum_pooled_outage_reject_new_miners(now_mono_ms)) return DATUM_POOLED_REFUSE_NO_COINBASER;
+	return DATUM_POOLED_REFUSE_NONE;
+}
+
+uint64_t datum_pooled_outage_since(void) {
+	uint64_t since;
+	pthread_mutex_lock(&datum_pooled_outage_lock);
+	since = datum_pooled_outage_since_ms;
+	pthread_mutex_unlock(&datum_pooled_outage_lock);
+	return since;
+}
+
+void datum_pooled_outage_reset(void) {
+	pthread_mutex_lock(&datum_pooled_outage_lock);
+	datum_pooled_outage_since_ms = 0;
+	datum_pooled_outage_published_seq = 0;
+	datum_pooled_outage_kicked = false;
+	pthread_mutex_unlock(&datum_pooled_outage_lock);
+}
+
 bool stratum_job_coinbaser_ready(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job) {
+	return stratum_job_coinbaser_ready_at(sdata, job, monotonic_time_millis());
+}
+
+bool stratum_job_coinbaser_ready_at(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job, uint64_t now_mono_ms) {
 	bool a = false;
-	// backup timeout for coinbaser on these jobs
-	if ((sdata->loop_tsms > job->tsms) && (sdata->loop_tsms - job->tsms) > 5000) {
+	// backup timeout for coinbaser on these jobs (solo only — see below)
+	if (!datum_config.datum_pooled_mining_only && (sdata->loop_tsms > job->tsms) && (sdata->loop_tsms - job->tsms) > 5000) {
 		// enforce a timeout of 5 seconds on waiting on a coinbaser...
 		sdata->full_coinbase_ready = false;
 		return true;
 	}
-	
+
 	pthread_rwlock_rdlock(&need_coinbaser_rwlocks[job->global_index]);
 	if (!job->need_coinbaser) {
 		a = true;
 	}
 	pthread_rwlock_unlock(&need_coinbaser_rwlocks[job->global_index]);
-	
+
 	if (a) {
 		sdata->full_coinbase_ready = true;
+		return true;
 	}
-	
-	return a;
+
+	// AlphaPool: pooled-only NEVER falls back to work that is
+	// not built from the pool's payout assignment (the placeholder
+	// coinbase classes). The job is ready exactly when the
+	// pool's coinbaser is in, however late; until then the miners stay on the
+	// last job they were given. Once the gateway has gone
+	// DATUM_POOLED_ONLY_COINBASER_FAILCLOSE_MS without a usable coinbaser for
+	// its current work (however many templates replaced each other meanwhile)
+	// drop the miners once so they fail over; the listener refuses new ones
+	// until a coinbaser is published again.
+	if (datum_config.datum_pooled_mining_only) {
+		uint64_t outage_ms = 0;
+		datum_pooled_outage_note_unready(job->job_seq, now_mono_ms);
+		if (datum_pooled_outage_kick_due(now_mono_ms, &outage_ms)) {
+			DLOG_ERROR("Pooled-only: no usable coinbaser from the pool for %llu ms (current job %d) — dropping miners so they fail over; refusing new miners until one is published (never serving work without the pool's payout assignment)",
+				(unsigned long long)outage_ms, job->global_index);
+			datum_stratum_v1_shutdown_all();
+		}
+	}
+	return false;
 }
 
 void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
@@ -551,10 +660,14 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 				sdata->full_coinbase_ready = false;
 				if (stratum_job_coinbaser_ready(sdata,job)) { // will set sdata->full_coinbase_ready = true if it's really ready.  if it times out, it will not.
 					DLOG_DEBUG("Blasting full work for type 4 job thread %d",my->thread_id);
+					// pooled-only skips the empty-work blast on a new block, so this
+					// is the first work for the new height: tell miners to drop
+					// their (now stale) previous work.
+					const bool clean_new = datum_config.datum_pooled_mining_only && job->is_new_block;
 					for(i=0;i<my->app->max_clients_thread;i++) {
 						m = my->client_data[i].app_client_data;
 						if (my->client_data[i].fd && m->subscribed) {
-							send_mining_notify(&my->client_data[i],false,false,false);
+							send_mining_notify(&my->client_data[i],clean_new,false,false);
 						}
 					}
 					
@@ -1115,6 +1228,18 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		}
 	}
 	
+	if (datum_config.datum_pooled_mining_only && !datum_stratum_pooled_share_class_allowed(job, empty_work, coinbase_index)) {
+		// AlphaPool release 3: pooled-only hands out ONLY the validated YUGE
+		// coinbase of a job whose coinbaser was published. The class and the
+		// "N" (subsidy-only) marker come from the job id the miner sends back,
+		// so a share naming any other class, or a job that was never published,
+		// is for work this gateway never served and that was not built from
+		// the pool's payout assignment.
+		send_unknown_work_error(c, id);
+		stratum_note_share(m, false, job_diff);
+		return 0;
+	}
+	
 	if (empty_work) {
 		cb = &job->subsidy_only_coinbase;
 	} else {
@@ -1261,7 +1386,15 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 		DLOG_WARN("************************************************************************************************");
 		DLOG_WARN("******** BLOCK FOUND - %s ********", new_notify_blockhash);
 		DLOG_WARN("************************************************************************************************");
-		
+		if (datum_config.datum_pooled_mining_only && (empty_work || job->need_coinbaser)) {
+			// Should be impossible now (pooled-only never serves such work); if it
+			// happens the block's coinbase was not built from the pool's payout
+			// assignment. Submit anyway — refusing would lose the block
+			// for everyone — but say so as loudly as possible.
+			DLOG_ERROR("UNASSIGNED-WORK BLOCK %s in pooled-only mode (empty_work=%d, coinbaser=%s): its coinbase was not built from the pool's payout assignment — please report this block to the pool",
+				new_notify_blockhash, empty_work ? 1 : 0, job->need_coinbaser ? "MISSING" : "present");
+		}
+
 		if (job->is_datum_job) {
 			(void)datum_protocol_pow_submit(c, job, username_s, true,
 				empty_work, quickdiff, block_header, job_diff,
@@ -1450,6 +1583,16 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 	return 0;
 }
 
+bool datum_stratum_pooled_share_class_allowed(const T_DATUM_STRATUM_JOB *job, bool empty_work, unsigned int coinbase_index) {
+	bool published;
+	
+	if (!job || empty_work || coinbase_index != COINBASE_TYPE_YUGE) return false;
+	pthread_rwlock_rdlock(&need_coinbaser_rwlocks[job->global_index]);
+	published = !job->need_coinbaser;
+	pthread_rwlock_unlock(&need_coinbaser_rwlocks[job->global_index]);
+	return published;
+}
+
 // The coinbase a BLAKE2b job commits to, the same for every miner: the
 // subsidy-only one for new-block work, COINBASE_TYPE_TINY (pays only the pool)
 // while the job state is below JOB_STATE_FULL_PRIORITY_WAIT_COINBASER or
@@ -1459,6 +1602,18 @@ int client_mining_authorize(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_
 // no per-miner selection.
 unsigned int datum_stratum_coinbase_index(
 	const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, bool new_block) {
+	if (datum_config.datum_pooled_mining_only) {
+		// AlphaPool: pooled-only serves a job ONLY
+		// with the pool's full assigned coinbase — never the subsidy-only
+		// new-block placeholder, never the TINY class: neither is built
+		// from the pool's payout assignment. Not ready yet
+		// (or no pool at all) means send nothing.
+		if (!sdata || !sdata->cur_stratum_job || !sdata->full_coinbase_ready ||
+		    sdata->cur_stratum_job->job_state < JOB_STATE_FULL_PRIORITY_WAIT_COINBASER) {
+			return DATUM_COINBASE_ID_NONE;
+		}
+		return COINBASE_TYPE_YUGE;
+	}
 	if (new_block) return DATUM_COINBASE_ID_EMPTY;
 	if (!sdata || !sdata->cur_stratum_job ||
 	    sdata->cur_stratum_job->job_state < JOB_STATE_FULL_PRIORITY_WAIT_COINBASER ||
@@ -1558,6 +1713,11 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
 	datum_socket_send_string_to_client(c, "{\"id\":null,\"method\":\"mining.notify\",\"params\":[");
 	
 	cbselect = datum_stratum_coinbase_index(sdata, new_block);
+	if (cbselect == DATUM_COINBASE_ID_NONE) {
+		// pooled-only and the pool's coinbase is not ready: send no job at all.
+		c->out_buf = notify_out_buf_start;
+		return -1;
+	}
 	const bool subsidy_only = cbselect == DATUM_COINBASE_ID_EMPTY;
 	cb = subsidy_only ? &j->subsidy_only_coinbase : &j->coinbase[cbselect];
 	
@@ -2107,6 +2267,9 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	} else {
 		s->need_coinbaser = false;
 	}
+	// creation order (the pooled-only outage tracker orders publications by it);
+	// the per-job pooled-only flags start clean from the memset above
+	s->job_seq = atomic_fetch_add(&stratum_job_seq_next, 1) + 1;
 	
 	// if this is a new block, invalidate all old work
 	if (new_block) {

@@ -51,6 +51,7 @@ bool datum_test_fail_(const char *expr, const char *file, unsigned int line, con
 	datum_test_(expr, #expr, __LINE__, __func__)
 
 uint64_t monotonic_time_seconds(void);
+uint64_t monotonic_time_millis(void);
 uint64_t current_time_millis(void);
 uint64_t current_time_micros(void);
 uint64_t get_process_uptime_seconds(void);

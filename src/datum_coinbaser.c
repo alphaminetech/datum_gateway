@@ -59,18 +59,17 @@ CURL *coinbaser_curl = NULL;
 
 const char *cbstart_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff"; // 82 len hex, 41 bytes
 
-int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
+// datum_active selects the pool's tags (and the Prime ID form of the unique ID
+// push) exactly as the live link state does in generate_coinbase_input().
+static int generate_coinbase_input_ex(int height, char *cb, int *target_pot_index, bool datum_active) {
 	int cb_input_sz = 0;
 	int tag_len[2] = { 0, 0 };
 	int k, m, i;
 	int excess;
-	bool datum_active = false;
 	
 	// let's figure out our coinbase tags w/BIP34 height
 	i = append_UNum_hex(height, &cb[0]);
 	cb_input_sz += i>>1;
-	
-	datum_active = datum_protocol_is_active();
 	
 	// Handle coinbase tagging
 	// The first push after the height should be:
@@ -166,7 +165,12 @@ int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
 		uchar_to_hex(&cb[i], (datum_config.coinbase_unique_id&0xFF)); i+=2; cb_input_sz++;
 		uchar_to_hex(&cb[i], ((datum_config.coinbase_unique_id>>8)&0xFF)); i+=2; cb_input_sz++;
 	} else {
-		uchar_to_hex(&cb[i], 0x0B); i+=2; cb_input_sz++;
+		// AlphaPool: a pool id that fits in 32 bits is written in the classic 7-byte form
+		// (PoT, unique id, 4-byte pool id) — byte-identical to what other DATUM gateway builds
+		// put on chain, so block explorers that recognise pooled DATUM coinbases by that
+		// push credit these blocks too. Larger ids keep the 11-byte form.
+		const bool prime_id_64 = (datum_config.prime_id >> 32) != 0;
+		uchar_to_hex(&cb[i], prime_id_64 ? 0x0B : 0x07); i+=2; cb_input_sz++;
 		if (target_pot_index != NULL) *target_pot_index = cb_input_sz;
 		uchar_to_hex(&cb[i], 0xFF); i+=2; cb_input_sz++; // placeholder for PoT target
 		uchar_to_hex(&cb[i], (datum_config.coinbase_unique_id&0xFF)); i+=2; cb_input_sz++;
@@ -175,13 +179,19 @@ int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
 		uchar_to_hex(&cb[i], ((datum_config.prime_id>>8)&0xFF)); i+=2; cb_input_sz++;
 		uchar_to_hex(&cb[i], ((datum_config.prime_id>>16)&0xFF)); i+=2; cb_input_sz++;
 		uchar_to_hex(&cb[i], ((datum_config.prime_id>>24)&0xFF)); i+=2; cb_input_sz++;
-		uchar_to_hex(&cb[i], ((datum_config.prime_id>>32)&0xFF)); i+=2; cb_input_sz++;
-		uchar_to_hex(&cb[i], ((datum_config.prime_id>>40)&0xFF)); i+=2; cb_input_sz++;
-		uchar_to_hex(&cb[i], ((datum_config.prime_id>>48)&0xFF)); i+=2; cb_input_sz++;
-		uchar_to_hex(&cb[i], ((datum_config.prime_id>>56)&0xFF)); i+=2; cb_input_sz++;
+		if (prime_id_64) {
+			uchar_to_hex(&cb[i], ((datum_config.prime_id>>32)&0xFF)); i+=2; cb_input_sz++;
+			uchar_to_hex(&cb[i], ((datum_config.prime_id>>40)&0xFF)); i+=2; cb_input_sz++;
+			uchar_to_hex(&cb[i], ((datum_config.prime_id>>48)&0xFF)); i+=2; cb_input_sz++;
+			uchar_to_hex(&cb[i], ((datum_config.prime_id>>56)&0xFF)); i+=2; cb_input_sz++;
+		}
 	}
 	
 	return cb_input_sz;
+}
+
+int generate_coinbase_input(int height, char *cb, int *target_pot_index) {
+	return generate_coinbase_input_ex(height, cb, target_pot_index, datum_protocol_is_active());
 }
 
 void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s, int coinbase_index, int remaining_size, bool space_for_en_in_coinbase, int *cb1idx, int *cb2idx, bool special_coinb1) {
@@ -522,7 +532,17 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	}
 }
 
-void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only) {
+// Builds every coinbase class of job s from s->available_coinbase_outputs[].
+// settle == NULL is upstream's behaviour: pool or no pool is decided from the
+// LIVE link state, here and again in generate_coinbase_input(). settle != NULL
+// (pooled-only) builds the DATUM coinbase with the settlement frozen when the
+// assignment was requested and never consults the link.
+// AlphaPool release 3: in pooled-only mode this is where a
+// coinbase without the pool's assignment is refused, whoever the caller: the
+// no-pool branch (local pool address) and empty_only (the pool output alone,
+// copied into every class including YUGE) are not built from an assignment.
+// Returns false, with the job untouched, when it refuses.
+static bool generate_coinbase_txns_for_stratum_job_ex(T_DATUM_STRATUM_JOB *s, bool empty_only, const T_DATUM_POOLED_SETTLEMENT *settle) {
 	// Account for available vsize, sigops, size, weight, etc
 	
 	// Note:
@@ -541,13 +561,33 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	
 	int cb_req_sz[MAX_COINBASE_TYPES] = { 0,0,0,0,0 };
 	
+	const bool datum_active = settle ? true : datum_protocol_is_active();
+	
+	if (!datum_active && !datum_coinbaser_local_fallback_allowed(false, datum_config.datum_pooled_mining_only)) {
+		DLOG_ERROR("Pooled-only: refusing to build job %d's coinbase without the DATUM pool (there is no payout assignment to build it from)", s->global_index);
+		return false;
+	}
+	if (datum_config.datum_pooled_mining_only && (empty_only || (s->available_coinbase_outputs_count <= 0))) {
+		DLOG_ERROR("Pooled-only: refusing to build job %d's coinbase without the pool's payout outputs (a payout assignment is required)", s->global_index);
+		return false;
+	}
+	if (settle && ((settle->pool_script_len <= 0) || (settle->pool_script_len > MAX_OUTPUT_SCRIPT_LEN))) {
+		DLOG_ERROR("Pooled-only: no pool payout script for job %d's coinbase", s->global_index);
+		return false;
+	}
+	
 	////////////////
 	
 	// Initial mainnet coinbaser
-	if (datum_protocol_is_active()) {
+	if (datum_active) {
 		// DATUM
-		s->pool_addr_script_len = datum_config.override_mining_pool_scriptpubkey_len;
-		memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptpubkey, datum_config.override_mining_pool_scriptpubkey_len);
+		if (settle) {
+			s->pool_addr_script_len = settle->pool_script_len;
+			memcpy(&s->pool_addr_script[0], settle->pool_script, settle->pool_script_len);
+		} else {
+			s->pool_addr_script_len = datum_config.override_mining_pool_scriptpubkey_len;
+			memcpy(&s->pool_addr_script[0], datum_config.override_mining_pool_scriptpubkey, datum_config.override_mining_pool_scriptpubkey_len);
+		}
 		s->is_datum_job = true;
 		if (s->available_coinbase_outputs_count == 0) {
 			empty_only = true;
@@ -570,7 +610,11 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 		cb1idx[i] = j;
 	}
 	
-	cb_input_sz = generate_coinbase_input(s->height, &cb[0], &target_pot_index);
+	if (settle) {
+		cb_input_sz = generate_coinbase_input_ex(s->height, &cb[0], &target_pot_index, true);
+	} else {
+		cb_input_sz = generate_coinbase_input(s->height, &cb[0], &target_pot_index);
+	}
 	s->target_pot_index = target_pot_index;
 	i = cb_input_sz << 1;
 	
@@ -788,81 +832,429 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 	}
 
 	datum_stratum_job_refresh_blake2b(s);
+	return true;
+}
+
+void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only) {
+	(void)generate_coinbase_txns_for_stratum_job_ex(s, empty_only, NULL);
+}
+
+bool generate_coinbase_txns_for_stratum_job_pooled(T_DATUM_STRATUM_JOB *s, const T_DATUM_POOLED_SETTLEMENT *settle) {
+	if (!settle) return false;
+	return generate_coinbase_txns_for_stratum_job_ex(s, false, settle);
 }
 
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen, bool must_free) {
-	// parse raw outputs from DATUM connection into a useful coinbaser
+	// Parse the pool's raw coinbaser (coinbaser ID byte, then outputs of value u64le, script
+	// length u8, script) into detached storage, and copy it into the job only if the WHOLE
+	// reply is well formed. Returns the number of payout outputs (>= 0), or -1 with the job's
+	// outputs, count and coinbaser ID untouched when the reply is rejected: truncated, a bad
+	// script length, an output that would take the total past the job's coinbase value
+	// (overflow-safe), more than DATUM_COINBASER_MAX_OUTPUTS outputs, or bytes left over.
+	// AlphaPool release 3: a reply is used whole or not at all. Upstream stopped at an
+	// over-value output and at output 512 and returned the count parsed up to there; such
+	// replies are now rejected. Malformed replies (truncation, bad script length) used to
+	// return 0 with the count cleared; they now return -1, which callers treat the same way.
+	T_DATUM_TXN_OUTPUT *outs = NULL;
 	uint64_t outval = 0;
 	uint64_t tally = 0;
 	int cidx = 0;
 	int slen = 0;
 	int cbvalid = 0;
 	int datum_id;
+	int result = -1;
 	
-	if (!coinbaser) {
-		DLOG_WARN("Coinbaser is NULL Using default/empty");
-		s->available_coinbase_outputs_count = 0;
-		return 0;
-	}
-	
-	if (cblen < 9) {
-		// 0 outputs possible
-		DLOG_WARN("Coinbaser length is invalid (too short). Using default/empty");
-		s->available_coinbase_outputs_count = 0;
-		return 0;
+	if (!coinbaser || cblen < 1) {
+		DLOG_WARN("Coinbaser is empty; rejecting it");
+		return -1;
 	}
 	
 	DLOG_DEBUG("Coinbaser v2 size %d", cblen);
 	
 	datum_id = coinbaser[cidx]; cidx++;
 	
+	if (cidx == cblen) {
+		// the coinbaser ID alone: a reply that carries no payout outputs (upstream: 0, count cleared)
+		s->available_coinbase_outputs_count = 0;
+		result = 0;
+		goto done;
+	}
+	
+	outs = calloc(DATUM_COINBASER_MAX_OUTPUTS, sizeof(*outs));
+	if (!outs) {
+		DLOG_ERROR("Could not allocate memory to parse a coinbaser; rejecting it");
+		goto done;
+	}
+	
 	while (cidx < cblen) {
-		if (cidx + 8 + 1 > cblen) {
-			DLOG_ERROR("Coinbaser length is invalid (mid-parsing). Using default/empty");
-			s->available_coinbase_outputs_count = 0;
-			return 0;
+		if (cbvalid >= DATUM_COINBASER_MAX_OUTPUTS) {
+			DLOG_ERROR("Coinbaser carries more than %d outputs; rejecting all of it", DATUM_COINBASER_MAX_OUTPUTS);
+			goto done;
+		}
+		if ((cblen - cidx) < (8 + 1)) {
+			DLOG_ERROR("Coinbaser length is invalid (%d byte(s) left over after output %d); rejecting all of it", cblen - cidx, cbvalid);
+			goto done;
 		}
 		outval = upk_u64le(coinbaser, cidx); cidx+=8;
-		if ((outval + tally) > s->coinbase_value) {
-			// we can't include this value, since it would put us over our total available!
-			// this shouldn't happen, however...
-			break;
+		// tally never exceeds the coinbase value, so this cannot wrap (the old tally + outval could)
+		if (outval > (s->coinbase_value - tally)) {
+			DLOG_ERROR("Coinbaser output %d (%"PRIu64" sats) takes the total past the job's coinbase value (%"PRIu64" of %"PRIu64" sats already assigned); rejecting all of it", cbvalid, outval, tally, s->coinbase_value);
+			goto done;
 		}
 		slen = coinbaser[cidx]; cidx++;
-		if (slen < 2 || slen > 64 || cidx + slen > cblen) {
-			DLOG_ERROR("Script length (%d) is invalid. Using default/empty", slen);
-			s->available_coinbase_outputs_count = 0;
-			return 0;
+		if (slen < 2 || slen > 64 || slen > (cblen - cidx)) {
+			DLOG_ERROR("Script length (%d) of coinbaser output %d is invalid; rejecting all of it", slen, cbvalid);
+			goto done;
 		}
 		
 		tally += outval;
-		memcpy(s->available_coinbase_outputs[cbvalid].output_script, &coinbaser[cidx], slen); cidx+=slen;
+		memcpy(outs[cbvalid].output_script, &coinbaser[cidx], slen); cidx+=slen;
 		// 64-bit value in sats is part of the output
-		s->available_coinbase_outputs[cbvalid].value_sats = outval;
-		if (s->available_coinbase_outputs[cbvalid].output_script[0] == 0x76) { // kludge for checking for P2PKH output
-			s->available_coinbase_outputs[cbvalid].sigops = 4;
+		outs[cbvalid].value_sats = outval;
+		if (outs[cbvalid].output_script[0] == 0x76) { // kludge for checking for P2PKH output
+			outs[cbvalid].sigops = 4;
 		} else {
-			s->available_coinbase_outputs[cbvalid].sigops = 0;
+			outs[cbvalid].sigops = 0;
 		}
 		
-		s->available_coinbase_outputs[cbvalid].output_script_len = slen;
+		outs[cbvalid].output_script_len = slen;
 		
 		cbvalid++;
-		
-		if (cbvalid >= 512) break; // limitation of datum for now
 	}
 	
+	// the whole reply is good: now, and only now, the job gets it
+	memcpy(s->available_coinbase_outputs, outs, (size_t)cbvalid * sizeof(*outs));
 	s->datum_coinbaser_id = datum_id;
 	s->available_coinbase_outputs_count = cbvalid;
-	if (coinbaser && must_free) free(coinbaser);
-	return cbvalid;
+	result = cbvalid;
+	
+done:
+	free(outs);
+	if (must_free) free(coinbaser);
+	return result;
+}
+
+// Reads a Bitcoin CompactSize at tx[*pos], advancing *pos. False if it runs past len.
+static bool datum_cb_read_varint(const unsigned char *tx, size_t len, size_t *pos, uint64_t *out) {
+	size_t n, i;
+	uint64_t v = 0;
+	unsigned char b;
+	
+	if (*pos >= len) return false;
+	b = tx[*pos]; (*pos)++;
+	if (b < 0xfd) {
+		*out = b;
+		return true;
+	}
+	n = (b == 0xfd) ? 2 : ((b == 0xfe) ? 4 : 8);
+	if ((len - *pos) < n) return false;
+	for (i = 0; i < n; i++) {
+		v |= ((uint64_t)tx[*pos + i]) << (8 * i);
+	}
+	*pos += n;
+	*out = v;
+	return true;
+}
+
+const char *datum_coinbaser_check_reason(int code) {
+	switch (code) {
+		case DATUM_CB_CHECK_OK: return "ok";
+		case DATUM_CB_CHECK_NO_ASSIGNMENT: return "no assignment or pool script to check against";
+		case DATUM_CB_CHECK_MALFORMED: return "coinbase does not decode as one transaction";
+		case DATUM_CB_CHECK_MISSING_OUTPUT: return "an assigned output is missing (truncated coinbase?)";
+		case DATUM_CB_CHECK_EXTRA_OUTPUT: return "an output that is not in the assignment";
+		case DATUM_CB_CHECK_NONZERO_OP_RETURN: return "an OP_RETURN output carries value";
+		case DATUM_CB_CHECK_POOL_AMOUNT: return "pool output is not exactly the unassigned remainder";
+		case DATUM_CB_CHECK_TOTAL: return "outputs do not add up to the coinbase value";
+		default: return "unknown";
+	}
+}
+
+// Pooled-only publication check (AlphaPool release 3). Decodes the coinbase
+// class a miner is actually served — coinb1, the 12 zero bytes the submit path puts where the
+// extranonce goes (on BLAKE2b the hasher's extranonce lives in the header), coinb2, with the
+// PoT placeholder byte set — as one transaction, and requires of its outputs:
+//   - every assignment output (script bytes + value, from s->available_coinbase_outputs[])
+//     is present, with exact multiplicity;
+//   - the only other output with value is the settlement's pool script, receiving exactly
+//     coinbase_value - sum(assignment), and it is present iff that remainder is > 0 (when the
+//     assignment covers the whole coinbase value there is none,
+//     and the builder writes a zero-value OP_RETURN "dead" output in its place);
+//   - every remaining output is a zero-value OP_RETURN (witness commitment, extranonce
+//     OP_RETURN when the extranonce does not fit in the coinbase input, the dead output);
+//   - the outputs add up to exactly s->coinbase_value.
+// Returns DATUM_CB_CHECK_OK or the first reason found.
+int datum_coinbaser_pooled_coinbase_check(const T_DATUM_STRATUM_JOB *s, int coinbase_index, const T_DATUM_POOLED_SETTLEMENT *settle) {
+	unsigned char tx[MAX_COINBASE_TXN_SIZE_BYTES];
+	bool used[DATUM_COINBASER_MAX_OUTPUTS];
+	const T_DATUM_STRATUM_COINBASE *cb;
+	uint64_t v, n_in, n_out, script_len, value, total = 0, assigned = 0, remainder, pool_value = 0;
+	size_t len, pos = 0, o, a;
+	const unsigned char *script;
+	const int n_assigned = s ? s->available_coinbase_outputs_count : 0;
+	bool matched, pool_seen = false;
+	
+	if (!s || !settle || (coinbase_index < 0) || (coinbase_index >= MAX_COINBASE_TYPES)) return DATUM_CB_CHECK_NO_ASSIGNMENT;
+	if ((n_assigned <= 0) || (n_assigned > DATUM_COINBASER_MAX_OUTPUTS)) return DATUM_CB_CHECK_NO_ASSIGNMENT;
+	if ((settle->pool_script_len <= 0) || (settle->pool_script_len > MAX_OUTPUT_SCRIPT_LEN)) return DATUM_CB_CHECK_NO_ASSIGNMENT;
+	
+	for (a = 0; a < (size_t)n_assigned; a++) {
+		if (s->available_coinbase_outputs[a].value_sats > (UINT64_MAX - assigned)) return DATUM_CB_CHECK_TOTAL;
+		assigned += s->available_coinbase_outputs[a].value_sats;
+	}
+	if (assigned > s->coinbase_value) return DATUM_CB_CHECK_TOTAL;
+	remainder = s->coinbase_value - assigned;
+	
+	// the transaction exactly as the miner/submit path assembles it
+	cb = &s->coinbase[coinbase_index];
+	if ((cb->coinb1_len < 1) || (cb->coinb2_len < 0)) return DATUM_CB_CHECK_MALFORMED;
+	len = (size_t)cb->coinb1_len + 12 + (size_t)cb->coinb2_len;
+	if (len > sizeof(tx)) return DATUM_CB_CHECK_MALFORMED;
+	memcpy(tx, cb->coinb1_bin, cb->coinb1_len);
+	memset(tx + cb->coinb1_len, 0, 12);
+	memcpy(tx + cb->coinb1_len + 12, cb->coinb2_bin, cb->coinb2_len);
+	if ((s->target_pot_index >= 0) && (s->target_pot_index < cb->coinb1_len)) {
+		tx[s->target_pot_index] = 0xFF;
+	}
+	
+	// version, one input (outpoint, script, sequence)
+	if (len < 4) return DATUM_CB_CHECK_MALFORMED;
+	pos = 4;
+	if (!datum_cb_read_varint(tx, len, &pos, &n_in) || (n_in != 1)) return DATUM_CB_CHECK_MALFORMED;
+	if ((len - pos) < 36) return DATUM_CB_CHECK_MALFORMED;
+	pos += 36;
+	if (!datum_cb_read_varint(tx, len, &pos, &script_len) || (script_len > (len - pos))) return DATUM_CB_CHECK_MALFORMED;
+	pos += (size_t)script_len;
+	if ((len - pos) < 4) return DATUM_CB_CHECK_MALFORMED;
+	pos += 4;
+	
+	// outputs
+	if (!datum_cb_read_varint(tx, len, &pos, &n_out) || (n_out < 1) || (n_out > ((len - pos) / 9))) return DATUM_CB_CHECK_MALFORMED;
+	memset(used, 0, sizeof(used));
+	for (o = 0; o < (size_t)n_out; o++) {
+		if ((len - pos) < 8) return DATUM_CB_CHECK_MALFORMED;
+		value = upk_u64le(tx, (int)pos); pos += 8;
+		if (!datum_cb_read_varint(tx, len, &pos, &v) || (v > (len - pos))) return DATUM_CB_CHECK_MALFORMED;
+		script = &tx[pos];
+		script_len = v;
+		pos += (size_t)v;
+		
+		if (value > (UINT64_MAX - total)) return DATUM_CB_CHECK_TOTAL;
+		total += value;
+		
+		// an assignment output not yet matched?
+		matched = false;
+		for (a = 0; a < (size_t)n_assigned; a++) {
+			if (used[a]) continue;
+			if (s->available_coinbase_outputs[a].value_sats != value) continue;
+			if ((uint64_t)s->available_coinbase_outputs[a].output_script_len != script_len) continue;
+			if (memcmp(s->available_coinbase_outputs[a].output_script, script, (size_t)script_len)) continue;
+			used[a] = true;
+			matched = true;
+			break;
+		}
+		if (matched) continue;
+		
+		// the pool's remainder output?
+		if ((value > 0) && (script_len == (uint64_t)settle->pool_script_len) && !memcmp(script, settle->pool_script, (size_t)script_len)) {
+			if (pool_seen) return DATUM_CB_CHECK_POOL_AMOUNT;
+			pool_seen = true;
+			pool_value = value;
+			continue;
+		}
+		
+		// anything else must be an OP_RETURN, and carry nothing
+		if ((script_len >= 1) && (script[0] == 0x6a)) {
+			if (value != 0) return DATUM_CB_CHECK_NONZERO_OP_RETURN;
+			continue;
+		}
+		return DATUM_CB_CHECK_EXTRA_OUTPUT;
+	}
+	
+	// lock time, and nothing after it
+	if ((len - pos) != 4) return DATUM_CB_CHECK_MALFORMED;
+	
+	for (a = 0; a < (size_t)n_assigned; a++) {
+		if (!used[a]) return DATUM_CB_CHECK_MISSING_OUTPUT;
+	}
+	if (remainder > 0) {
+		if (!pool_seen || (pool_value != remainder)) return DATUM_CB_CHECK_POOL_AMOUNT;
+	} else if (pool_seen) {
+		return DATUM_CB_CHECK_POOL_AMOUNT;
+	}
+	if (total != s->coinbase_value) return DATUM_CB_CHECK_TOTAL;
+	
+	return DATUM_CB_CHECK_OK;
+}
+
+// May the coinbaser thread build a coinbase WITHOUT the pool's coinbaser? Only
+// solo mode may (that coinbase pays the miner's own address). Pooled-only never
+// may: a local coinbase there is not built from the pool's payout assignment.
+bool datum_coinbaser_local_fallback_allowed(bool protocol_active, bool pooled_only) {
+	if (protocol_active) return false;   // the pool's coinbaser is the only source
+	return !pooled_only;
+}
+
+// What the coinbaser thread may build from a fetch result. `fetched` is
+// datum_protocol_coinbaser_fetch()'s answer: >0 payout outputs parsed, 0 = a
+// reply carrying none, -1 = no usable reply (link down, send failed, timeout,
+// wait error). Returns the output count to build with (>= 0), or -1 = keep the
+// job waiting. Pooled-only builds ONLY from a reply with payout outputs: a
+// coinbase built from anything else would not carry the pool's payout
+// assignment. Solo keeps upstream's behaviour: mine on its own address.
+int datum_coinbaser_outputs_decision(int fetched, bool pooled_only) {
+	if (fetched > 0) return fetched;
+	if (pooled_only) return -1;
+	return 0;
+}
+
+// Marks job s published: miners may be sent it from now on. Pooled-only also ends the
+// coinbaser outage, atomically with the flag (the tracker's lock nests inside the job's).
+static bool datum_coinbaser_publish(T_DATUM_STRATUM_JOB *s, bool pooled_only) {
+	if (!need_coinbaser_rwlocks_init_done) return false;
+	pthread_rwlock_wrlock(&need_coinbaser_rwlocks[s->global_index]);
+	s->need_coinbaser = false;
+	if (pooled_only) datum_pooled_outage_note_published(s->job_seq);
+	pthread_rwlock_unlock(&need_coinbaser_rwlocks[s->global_index]);
+	return true;
+}
+
+// Pooled-only step (AlphaPool release 3). The coinbase that is
+// published is built from a complete assignment only, with nothing taken from the live link
+// state, checked output by output against that assignment, and published only while the DATUM
+// session the assignment was requested on is still the active one. Anything else leaves
+// need_coinbaser set: miners keep the work they have (the fail-close tracker drops them if
+// this lasts) and the job is asked for again.
+static int datum_coinbaser_pooled_step(T_DATUM_STRATUM_JOB *s, const T_DATUM_COINBASER_IO *io) {
+	T_DATUM_POOLED_SETTLEMENT settle;
+	uint64_t request_generation = 0;
+	int fetched, check;
+	
+	if (!io->link_active(io->ctx)) {
+		// no pool, no coinbase: pooled-only never builds one locally
+		datum_pooled_outage_note_unready(s->job_seq, io->now_ms(io->ctx));
+		return DATUM_COINBASER_STEP_WAIT;
+	}
+	
+	// what the assignment will be bound to: the pool's remainder script as configured now
+	// (the session is the one the request actually goes out on, reported by the fetch)
+	memset(&settle, 0, sizeof(settle));
+	settle.pool_script_len = datum_config.override_mining_pool_scriptpubkey_len;
+	if ((settle.pool_script_len <= 0) || (settle.pool_script_len > MAX_OUTPUT_SCRIPT_LEN)) {
+		datum_pooled_outage_note_unready(s->job_seq, io->now_ms(io->ctx));
+		return DATUM_COINBASER_STEP_WAIT;
+	}
+	memcpy(settle.pool_script, datum_config.override_mining_pool_scriptpubkey, settle.pool_script_len);
+	
+	fetched = io->fetch(io->ctx, s, &request_generation);
+	if (datum_coinbaser_outputs_decision(fetched, true) < 0) {
+		// no usable reply (link down, send failure, timeout), a rejected reply, or a reply
+		// without payout outputs: there is no payout assignment to build a coinbase from
+		if ((fetched == 0) && !s->pooled_zero_outputs_logged) {
+			s->pooled_zero_outputs_logged = true;
+			DLOG_WARN("Pooled-only: the pool's coinbaser for job %d carried no payout outputs — not building a coinbase from it, retrying", s->global_index);
+		}
+		datum_pooled_outage_note_unready(s->job_seq, io->now_ms(io->ctx));
+		// an empty or rejected reply comes back fast; do not hammer the pool
+		return ((fetched == 0) || (fetched == DATUM_COINBASER_FETCH_REJECTED)) ? DATUM_COINBASER_STEP_BACKOFF : DATUM_COINBASER_STEP_WAIT;
+	}
+	settle.session_generation = request_generation;
+	s->coinbaser_session_generation = request_generation;
+	
+	DLOG_DEBUG("Generating coinbases for %d assigned outputs (session %"PRIu64")", fetched, request_generation);
+	if (!generate_coinbase_txns_for_stratum_job_pooled(s, &settle)) {
+		datum_pooled_outage_note_unready(s->job_seq, io->now_ms(io->ctx));
+		return DATUM_COINBASER_STEP_BACKOFF;
+	}
+	
+	// the key guard: the class miners are served must pay exactly this assignment
+	check = datum_coinbaser_pooled_coinbase_check(s, COINBASE_TYPE_YUGE, &settle);
+	if (check != DATUM_CB_CHECK_OK) {
+		if (!s->pooled_withheld_logged) {
+			s->pooled_withheld_logged = true;
+			DLOG_ERROR("Pooled-only: WITHHOLDING job %d — its coinbase fails the publication check: %s (%d assigned output(s), coinbase value %"PRIu64" sats). Not serving it; asking the pool again.",
+				s->global_index, datum_coinbaser_check_reason(check), s->available_coinbase_outputs_count, s->coinbase_value);
+		}
+		datum_pooled_outage_note_unready(s->job_seq, io->now_ms(io->ctx));
+		return DATUM_COINBASER_STEP_BACKOFF;
+	}
+	
+	// The assignment belongs to the session it was requested on: if that session ended (link
+	// down, or a reconnect started a new generation) or the pool changed its payout script
+	// meanwhile, it is stale. Nothing built above has reached a miner; discard and ask again.
+	if ((!request_generation) || (!io->link_active(io->ctx)) || (io->session_generation(io->ctx) != request_generation) ||
+	    (datum_config.override_mining_pool_scriptpubkey_len != settle.pool_script_len) ||
+	    memcmp(datum_config.override_mining_pool_scriptpubkey, settle.pool_script, settle.pool_script_len)) {
+		if (!s->pooled_stale_logged) {
+			s->pooled_stale_logged = true;
+			DLOG_WARN("Pooled-only: discarding job %d's coinbaser — DATUM session %"PRIu64" it was requested on is no longer active; asking again", s->global_index, request_generation);
+		}
+		datum_pooled_outage_note_unready(s->job_seq, io->now_ms(io->ctx));
+		return DATUM_COINBASER_STEP_WAIT;
+	}
+	
+	if (!datum_coinbaser_publish(s, true)) {
+		datum_pooled_outage_note_unready(s->job_seq, io->now_ms(io->ctx));
+		return DATUM_COINBASER_STEP_WAIT;
+	}
+	DLOG_DEBUG("Generated, checked and notified (job %d, %d outputs, session %"PRIu64").", s->global_index, fetched, request_generation);
+	return DATUM_COINBASER_STEP_PUBLISHED;
+}
+
+int datum_coinbaser_job_step(T_DATUM_STRATUM_JOB *s, const T_DATUM_COINBASER_IO *io) {
+	uint64_t request_generation = 0;
+	
+	if (!s || !io) return DATUM_COINBASER_STEP_WAIT;
+	if (datum_config.datum_pooled_mining_only) {
+		return datum_coinbaser_pooled_step(s, io);
+	}
+	
+	// Not pooled-only: upstream's behaviour, unchanged. With the link down or no usable reply
+	// the job is built without the pool's payout outputs, exactly as upstream builds it,
+	// and published.
+	const bool link_active = io->link_active(io->ctx);
+	const int fetched = link_active ? io->fetch(io->ctx, s, &request_generation) : -1;
+	const int i = datum_coinbaser_outputs_decision(fetched, false);
+	if (fetched <= 0) s->available_coinbase_outputs_count = 0; // solo: our own address only
+	DLOG_DEBUG("Generating coinbases for up to %d outputs", i);
+	generate_coinbase_txns_for_stratum_job(s, false);
+	if (!datum_coinbaser_publish(s, false)) return DATUM_COINBASER_STEP_WAIT;
+	DLOG_DEBUG("Generated and notified.");
+	return DATUM_COINBASER_STEP_PUBLISHED;
+}
+
+static int datum_coinbaser_io_fetch(void *ctx, T_DATUM_STRATUM_JOB *s, uint64_t *request_generation) {
+	(void)ctx;
+	return datum_protocol_coinbaser_fetch_ex(s, request_generation);
+}
+
+static bool datum_coinbaser_io_link_active(void *ctx) {
+	(void)ctx;
+	return datum_protocol_is_active();
+}
+
+static uint64_t datum_coinbaser_io_session_generation(void *ctx) {
+	(void)ctx;
+	return datum_protocol_session_generation();
+}
+
+static uint64_t datum_coinbaser_io_now_ms(void *ctx) {
+	(void)ctx;
+	return monotonic_time_millis();
 }
 
 void *datum_coinbaser_thread(void *ptr) {
 	int sjob = -1;
 	T_DATUM_STRATUM_JOB *s = NULL;
 	bool need_coinbaser = false;
-	int i;
+	int r;
+	const T_DATUM_COINBASER_IO io = {
+		.fetch = datum_coinbaser_io_fetch,
+		.link_active = datum_coinbaser_io_link_active,
+		.session_generation = datum_coinbaser_io_session_generation,
+		.now_ms = datum_coinbaser_io_now_ms,
+		.ctx = NULL,
+	};
 	
 	DLOG_DEBUG("Coinbaser thread active");
 	
@@ -886,22 +1278,16 @@ void *datum_coinbaser_thread(void *ptr) {
 		if (need_coinbaser) {
 			// fetch remote coinbaser for job
 			DLOG_DEBUG("Job %d needs a coinbaser!", sjob);
-			if (datum_protocol_is_active()) {
-				i = datum_protocol_coinbaser_fetch(s);
-			} else {
-				s->available_coinbase_outputs_count = 0;
-				i = 0;
-			}
-			if (i>=0) {
-				DLOG_DEBUG("Generating coinbases for up to %d outputs", i);
-				generate_coinbase_txns_for_stratum_job(s, false);
-				if (need_coinbaser_rwlocks_init_done) {
-					pthread_rwlock_wrlock(&need_coinbaser_rwlocks[sjob]);
-					s->need_coinbaser = false;
-					pthread_rwlock_unlock(&need_coinbaser_rwlocks[sjob]);
-					need_coinbaser = false;
-				}
-				DLOG_DEBUG("Generated and notified.");
+			// AlphaPool release 3: pooled-only never publishes
+			// a coinbase without the pool's complete payout assignment — see
+			// datum_coinbaser_pooled_step(). Until one is published the job stays waiting
+			// (the stratum side keeps miners on their last work and fails closed) and this
+			// loop asks again. Solo keeps upstream's behaviour.
+			r = datum_coinbaser_job_step(s, &io);
+			if (r == DATUM_COINBASER_STEP_PUBLISHED) {
+				need_coinbaser = false;
+			} else if (r == DATUM_COINBASER_STEP_BACKOFF) {
+				usleep(250000);
 			}
 		}
 		

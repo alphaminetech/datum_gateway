@@ -35,6 +35,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -951,7 +952,274 @@ static void datum_identity_keyfile_tests(void) {
 	rmdir(dir);
 }
 
+static void datum_coinbaser_fetch_no_reply_tests(void) {
+	// AlphaPool: with no usable reply the fetch
+	// must say so (-1), never 0 — the coinbaser thread builds a coinbase from 0.
+	// Here the protocol is not connected (client_active != 3); the value is a
+	// real subsidy so the epoch-V early return (0) does not apply.
+	T_DATUM_STRATUM_JOB *job = calloc(1, sizeof(*job));
+	const int saved_active = atomic_load(&datum_protocol_client_active);
+
+	datum_test(job != NULL);
+	if (!job) return;
+	job->coinbase_value = 312500000;
+	atomic_store(&datum_protocol_client_active, 0);
+	datum_test(datum_protocol_coinbaser_fetch(job) == -1);
+	datum_test(job->available_coinbase_outputs_count == 0);
+	atomic_store(&datum_protocol_client_active, 2);   // handshake not finished
+	datum_test(datum_protocol_coinbaser_fetch(job) == -1);
+	// epoch-V value: upstream's early "no outputs" answer is unchanged
+	job->coinbase_value = 1000;
+	datum_test(datum_protocol_coinbaser_fetch(job) == 0);
+	atomic_store(&datum_protocol_client_active, saved_active);
+	free(job);
+}
+
+/* ---- AlphaPool release 3: a coinbaser reply is consumed
+ * only by the request it answers ---- */
+
+static void datum_coinbaser_reply_match_tests(void) {
+	// value, session and (when echoed) token must all be the request's
+	datum_test(datum_coinbaser_reply_matches(100, 7, false, 0, 100, 7, 0xabcdef01));
+	datum_test(datum_coinbaser_reply_matches(100, 7, true, 0xabcdef01, 100, 7, 0xabcdef01));
+	datum_test(!datum_coinbaser_reply_matches(101, 7, false, 0, 100, 7, 0xabcdef01));          // another value
+	datum_test(!datum_coinbaser_reply_matches(100, 8, false, 0, 100, 7, 0xabcdef01));          // arrived on a newer session
+	datum_test(!datum_coinbaser_reply_matches(100, 8, true, 0xabcdef01, 100, 7, 0xabcdef01));  // ...even echoing our token
+	datum_test(!datum_coinbaser_reply_matches(100, 7, true, 0xabcdef02, 100, 7, 0xabcdef01));  // answers another request
+}
+
+typedef struct {
+	// set before the fetch
+	int start_out;
+	uint32_t header_key;
+	unsigned char nonce[crypto_box_NONCEBYTES];
+	uint64_t value;          // the value the reply carries
+	const unsigned char *blob;
+	int blob_len;
+	bool with_echo;
+	uint32_t echo_xor;       // the echo is token ^ echo_xor (0 = the right token)
+	int junk_trailing;       // bytes of junk after the coinbaser instead of an echo
+	bool bump_generation;    // a reconnect happens after the request went out
+	const unsigned char *late_blob; // first a late reply to an earlier request (other token)...
+	int late_blob_len;
+	// observed
+	bool request_ok;
+	uint32_t token;
+	int stored;
+	uint64_t injected_at;
+} T_R3_INJECT;
+
+static int r3_inject_reply(uint64_t value, const unsigned char *blob, int blob_len, bool with_echo, uint32_t echo, int junk) {
+	unsigned char data[4096];
+	int len = 12;
+	pk_u64le(data, 0, value);
+	pk_u32le(data, 8, (uint32_t)blob_len);
+	memcpy(data + 12, blob, blob_len); len += blob_len;
+	if (with_echo) {
+		pk_u32le(data, len, echo); len += 4;
+	}
+	if (junk > 0) {
+		memset(data + len, 0xE7, junk); len += junk;
+	}
+	return datum_protocol_coinbaser_fetch_response(len, data);
+}
+
+static void *r3_inject_thread(void *arg) {
+	T_R3_INJECT *in = arg;
+	unsigned char frame[512], clear[256];
+	T_DATUM_PROTOCOL_HEADER h;
+	uint32_t key = in->header_key;
+	unsigned char nonce[crypto_box_NONCEBYTES];
+	size_t n = 0, off = 0;
+	int i, clear_len;
+	
+	// the request as it went out: wait for it in the send buffer, then decrypt it
+	for (i = 0; (i < 50000) && !n; i++) {
+		pthread_mutex_lock(&datum_protocol_send_buffer_lock);
+		if (server_out_buf > in->start_out) {
+			n = (size_t)(server_out_buf - in->start_out);
+			if (n > sizeof(frame)) n = sizeof(frame);
+			memcpy(frame, server_send_buffer + in->start_out, n);
+		}
+		pthread_mutex_unlock(&datum_protocol_send_buffer_lock);
+		if (!n) usleep(100);
+	}
+	if (!n) return NULL;
+	memcpy(nonce, in->nonce, sizeof(nonce));
+	clear_len = datum_protocol_test_decrypt_frame(frame, n, &off, &key, nonce, &h, clear, sizeof(clear));
+	// legacy request (bytes 0..41) untouched; the token extension right after the 0xFE
+	in->request_ok = (clear_len >= 57) && (h.proto_cmd == 5) && (clear[0] == 0x10) &&
+		(upk_u64le(clear, 1) == in->value) && (clear[41] == 0xFE) &&
+		!memcmp(clear + 42, DATUM_COINBASER_TOKEN_MARKER, DATUM_COINBASER_TOKEN_MARKER_LEN) &&
+		(clear[50] == DATUM_COINBASER_TOKEN_VERSION) && (clear[51] == 4);
+	in->token = (clear_len >= 56) ? upk_u32le(clear, 52) : 0;
+	
+	if (in->bump_generation) atomic_fetch_add(&datum_session_generation, 1);
+	if (in->late_blob) {
+		in->stored += r3_inject_reply(in->value, in->late_blob, in->late_blob_len, true, in->token ^ 0x5a5a5a5a, 0);
+		usleep(20000); // let the fetch look at it before the right one lands
+	}
+	in->stored += r3_inject_reply(in->value, in->blob, in->blob_len, in->with_echo, in->token ^ in->echo_xor, in->junk_trailing);
+	in->injected_at = monotonic_time_millis();
+	return NULL;
+}
+
+// Runs the real fetch against an injected reply. Returns the fetch result.
+static int r3_fetch_with(T_R3_INJECT *in, T_DATUM_STRATUM_JOB *job, uint64_t *request_generation, unsigned int timeout_ms, uint64_t *elapsed_ms, uint64_t *returned_at) {
+	pthread_t th;
+	uint64_t t0;
+	int r;
+	
+	pthread_mutex_lock(&datum_protocol_send_buffer_lock);
+	in->start_out = server_out_buf;
+	in->header_key = sending_header_key;
+	memcpy(in->nonce, session_nonce_sender, sizeof(in->nonce));
+	pthread_mutex_unlock(&datum_protocol_send_buffer_lock);
+	datum_protocol_coinbaser_fetch_timeout_ms = timeout_ms;
+	if (pthread_create(&th, NULL, r3_inject_thread, in) != 0) return -99;
+	t0 = monotonic_time_millis();
+	r = datum_protocol_coinbaser_fetch_ex(job, request_generation);
+	*returned_at = monotonic_time_millis();
+	*elapsed_ms = *returned_at - t0;
+	pthread_join(th, NULL);
+	datum_protocol_coinbaser_fetch_timeout_ms = 5000;
+	pthread_mutex_lock(&datum_protocol_send_buffer_lock);
+	server_out_buf = in->start_out; // nothing was going to be flushed to anyone
+	pthread_mutex_unlock(&datum_protocol_send_buffer_lock);
+	return r;
+}
+
+static int r3_blob(unsigned char *blob, uint8_t cbid, uint64_t v1, uint64_t v2) {
+	int i = 0;
+	blob[i++] = cbid;
+	pk_u64le(blob, i, v1); i += 8;
+	blob[i++] = 2; blob[i++] = 0x00; blob[i++] = 0x51;
+	pk_u64le(blob, i, v2); i += 8;
+	blob[i++] = 2; blob[i++] = 0x00; blob[i++] = 0x52;
+	return i;
+}
+
+static void datum_coinbaser_fetch_binding_tests(void) {
+	const int saved_active = atomic_load(&datum_protocol_client_active);
+	const uint32_t saved_header_key = sending_header_key;
+	unsigned char saved_nonce[sizeof(session_nonce_sender)];
+	T_DATUM_STRATUM_JOB *job = calloc(1, sizeof(*job));
+	unsigned char blob[64], blob2[64], bad[64];
+	int blob_len, blob2_len, bad_len, r;
+	uint64_t gen, elapsed, returned_at, g_before;
+	uint32_t first_token;
+	T_R3_INJECT in;
+	
+	memcpy(saved_nonce, session_nonce_sender, sizeof(saved_nonce));
+	datum_test(job != NULL);
+	if (!job) return;
+	job->coinbase_value = 312500000;
+	memset(job->prevhash_bin, 0x3c, 32);
+	atomic_store(&datum_protocol_client_active, 3);
+	blob_len = r3_blob(blob, 0x21, 100000000, 212500000);
+	blob2_len = r3_blob(blob2, 0x22, 150000000, 162500000);
+	bad_len = r3_blob(bad, 0x23, 100000000, 212500001); // one satoshi over the value
+	
+	// A: a server without the echo, the reply on the request's session: consumed.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value; in.blob = blob; in.blob_len = blob_len;
+	g_before = atomic_load(&datum_session_generation);
+	r = r3_fetch_with(&in, job, &gen, 5000, &elapsed, &returned_at);
+	datum_test(in.request_ok);
+	datum_test(r == 2);
+	datum_test(gen == g_before);
+	datum_test(job->datum_coinbaser_id == 0x21);
+	datum_test(job->available_coinbase_outputs_count == 2);
+	first_token = in.token;
+	
+	// B: regression — the session changes while waiting and a same-value
+	// reply arrives on the new one. Earlier code consumed it (adopting its cbid).
+	// Now it is not consumed, and the fetch stops waiting at once.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value; in.blob = blob2; in.blob_len = blob2_len;
+	in.bump_generation = true;
+	r = r3_fetch_with(&in, job, &gen, 5000, &elapsed, &returned_at);
+	datum_test(in.request_ok);
+	datum_test(in.stored == 1);
+	datum_test(r == DATUM_COINBASER_FETCH_NO_REPLY);
+	datum_test(gen == 0);
+	datum_test(job->datum_coinbaser_id == 0x21);            // not 0x22
+	datum_test(job->available_coinbase_outputs_count == 0); // nothing adopted
+	datum_test(elapsed < 2500);
+	datum_test(in.token != first_token);                     // a fresh token per request
+	
+	// C: a server that echoes the token, echoing ours: consumed.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value; in.blob = blob2; in.blob_len = blob2_len;
+	in.with_echo = true;
+	g_before = atomic_load(&datum_session_generation);
+	r = r3_fetch_with(&in, job, &gen, 5000, &elapsed, &returned_at);
+	datum_test(in.request_ok);
+	datum_test(r == 2);
+	datum_test(gen == g_before);
+	datum_test(job->datum_coinbaser_id == 0x22);
+	
+	// D: same session and value, but echoing another request's token (a late reply
+	// to an earlier request): not consumed; the fetch times out waiting for its own.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value; in.blob = blob; in.blob_len = blob_len;
+	in.with_echo = true; in.echo_xor = 0x00010000;
+	r = r3_fetch_with(&in, job, &gen, 400, &elapsed, &returned_at);
+	datum_test(in.request_ok);
+	datum_test(in.stored == 1);
+	datum_test(in.injected_at <= returned_at);               // it was there to be taken
+	datum_test(r == DATUM_COINBASER_FETCH_NO_REPLY);
+	datum_test(elapsed >= 350);
+	datum_test(job->datum_coinbaser_id == 0x22);            // not 0x21
+	datum_test(job->available_coinbase_outputs_count == 0);
+	
+	// E: the late reply first, then ours: ours is the one consumed.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value; in.blob = blob; in.blob_len = blob_len;
+	in.with_echo = true;
+	in.late_blob = blob2; in.late_blob_len = blob2_len;
+	r = r3_fetch_with(&in, job, &gen, 5000, &elapsed, &returned_at);
+	datum_test(in.stored == 2);
+	datum_test(r == 2);
+	datum_test(job->datum_coinbaser_id == 0x21);
+	
+	// F: no echo but junk of another length after the coinbaser: tolerated as
+	// before (no echo), consumed on the matching session.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value; in.blob = blob2; in.blob_len = blob2_len;
+	in.junk_trailing = 3;
+	r = r3_fetch_with(&in, job, &gen, 5000, &elapsed, &returned_at);
+	datum_test(r == 2);
+	datum_test(job->datum_coinbaser_id == 0x22);
+	
+	// G: our reply, but malformed (a satoshi over the value): rejected whole.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value; in.blob = bad; in.blob_len = bad_len;
+	in.with_echo = true;
+	r = r3_fetch_with(&in, job, &gen, 5000, &elapsed, &returned_at);
+	datum_test(r == DATUM_COINBASER_FETCH_REJECTED);
+	datum_test(gen == 0);
+	datum_test(job->datum_coinbaser_id == 0x22);
+	datum_test(job->available_coinbase_outputs_count == 0);
+	
+	// H: another value (the original predicate, kept): not consumed.
+	memset(&in, 0, sizeof(in));
+	in.value = job->coinbase_value + 1; in.blob = blob; in.blob_len = blob_len;
+	r = r3_fetch_with(&in, job, &gen, 400, &elapsed, &returned_at);
+	datum_test(in.stored == 1);
+	datum_test(r == DATUM_COINBASER_FETCH_NO_REPLY);
+	datum_test(job->datum_coinbaser_id == 0x22);
+	
+	atomic_store(&datum_protocol_client_active, saved_active);
+	sending_header_key = saved_header_key;
+	memcpy(session_nonce_sender, saved_nonce, sizeof(saved_nonce));
+	free(job);
+}
+
 void datum_protocol_tests(void) {
+	datum_coinbaser_fetch_no_reply_tests();
+	datum_coinbaser_reply_match_tests();
+	datum_coinbaser_fetch_binding_tests();
 	datum_protocol_config_v3_tests();
 	datum_protocol_migration_tests();
 	datum_protocol_bulk_tests();

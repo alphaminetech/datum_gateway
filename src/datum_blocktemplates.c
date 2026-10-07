@@ -514,6 +514,25 @@ void *datum_gateway_template_thread(void *args) {
 					const bool new_block = strcmp(t->previousblockhash, p1);
 					if (new_block || notify_othercause) {
 						notify_othercause = 0;
+						if (datum_config.datum_pooled_mining_only) {
+							// AlphaPool: pooled-only skips the subsidy-only "empty work"
+							// placeholder entirely, because that work is not built from the
+							// pool's payout assignment. The old-height jobs are marked stale here
+							// (new_block=true) and miners get the new height as soon as the
+							// pool's coinbaser is in; the
+							// type-4 blast then sends it with clean_jobs.
+							if (new_block) {
+								last_block_change = current_time_millis();
+								strcpy(p1, t->previousblockhash);
+								was_notified = false;
+								DLOG_INFO("NEW NETWORK BLOCK: %s (%lu)", t->previousblockhash, (unsigned long)t->height);
+							} else {
+								DLOG_DEBUG("Urgent work update triggered");
+							}
+							i = datum_stratum_v1_global_subscriber_count();
+							DLOG_INFO("Updating priority stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (pooled-only: sent to %llu stratum client%s once the coinbaser is in)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
+							update_stratum_job(t,true,JOB_STATE_FULL_PRIORITY_WAIT_COINBASER);
+						} else {
 						update_stratum_job(t,true,JOB_STATE_EMPTY_PLUS);
 						if (new_block) {
 							last_block_change = current_time_millis();
@@ -523,11 +542,11 @@ void *datum_gateway_template_thread(void *args) {
 						} else {
 							DLOG_DEBUG("Urgent work update triggered");
 						}
-						
+
 						// sleep for a milisecond
 						// this will let other threads churn for a moment.  we wont get all the empty jobs blasted out in a milisecond anyway
 						usleep(1000);
-						
+
 						// wait for the empties to complete
 						DLOG_DEBUG("Waiting on empty work send completion...");
 						for(j=0;j<4000;j++) {
@@ -535,12 +554,13 @@ void *datum_gateway_template_thread(void *args) {
 							usleep(1001);
 						}
 						DLOG_DEBUG("Empty sends done!");
-						
+
 						// use this template to setup for a coinbaser wait job while the empty + full w/blank jobs are blasted
 						// then this job will get blasted when its ready.
 						i = datum_stratum_v1_global_subscriber_count();
 						DLOG_INFO("Updating priority stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
 						update_stratum_job(t,false,JOB_STATE_FULL_PRIORITY_WAIT_COINBASER);
+						}
 					} else {
 						if (was_notified) {
 							// we got a notification of a new block, but there doesn't seem to actually be a new block.

@@ -127,6 +127,13 @@ uint64_t monotonic_time_seconds(void) {
 	return (uint64_t)ts.tv_sec;
 }
 
+// Milliseconds on CLOCK_MONOTONIC: for intervals that must not jump with the wall clock.
+uint64_t monotonic_time_millis(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+}
+
 uint64_t current_time_millis(void) {
 	struct timeval te;
 	gettimeofday(&te, NULL); // get current time

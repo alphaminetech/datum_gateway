@@ -60,6 +60,7 @@
 #include "datum_protocol.h"
 #include "datum_utils.h"
 #include "datum_sockets.h"
+#include "datum_stratum.h"
 
 int datum_active_threads = 0;
 int datum_active_clients = 0;
@@ -672,6 +673,7 @@ bool datum_sockets_setup_listening_sockets(const char * const purpose, const cha
 void *datum_gateway_listener_thread(void *arg) {
 	int i, ret;
 	bool rejecting_now = false;
+	bool rejecting_for_coinbaser = false;
 	uint64_t last_reject_msg_tsms = 0, curtime_tsms = 0;
 	uint64_t reject_count = 0;
 	
@@ -736,7 +738,15 @@ void *datum_gateway_listener_thread(void *arg) {
 	for (;;) {
 		nfds = epoll_wait(epollfd, events, MAX_EVENTS, 100);
 		if (nfds) {
-			if (datum_config.datum_pooled_mining_only && (!datum_protocol_is_active())) {
+			// AlphaPool release 3: pooled-only also refuses new miners while the
+			// pool has sent no usable coinbaser for longer than the fail-close
+			// bound (the miners already connected were dropped then); they would
+			// only get no work here. Accepting resumes with the next published
+			// coinbaser.
+			const int refusal = datum_pooled_only_new_miner_refusal(datum_config.datum_pooled_mining_only,
+				datum_protocol_is_active(), monotonic_time_millis());
+			rejecting_for_coinbaser = (refusal == DATUM_POOLED_REFUSE_NO_COINBASER);
+			if (refusal != DATUM_POOLED_REFUSE_NONE) {
 				curtime_tsms = current_time_millis(); // we only need this if we're rejecting connections
 				if (!rejecting_now) {
 					last_reject_msg_tsms = curtime_tsms - 5000; // first disconnect triggers msg
@@ -757,7 +767,11 @@ void *datum_gateway_listener_thread(void *arg) {
 				if (rejecting_now) {
 					reject_count++;
 					if ((curtime_tsms - last_reject_msg_tsms) > 5000) {
+						if (rejecting_for_coinbaser) {
+							DLOG_INFO("No usable coinbaser from the DATUM pool and configured for pooled mining only! Rejecting connection. (%llu connections rejected since last noted)", (unsigned long long)reject_count);
+						} else {
 						DLOG_INFO("DATUM not connected and configured for pooled mining only! Rejecting connection. (%llu connections rejected since last noted)", (unsigned long long)reject_count);
+						}
 						last_reject_msg_tsms = curtime_tsms;
 						reject_count = 0;
 					}

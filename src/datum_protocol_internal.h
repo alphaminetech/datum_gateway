@@ -36,6 +36,7 @@
 #ifndef _DATUM_PROTOCOL_INTERNAL_H_
 #define _DATUM_PROTOCOL_INTERNAL_H_
 
+#include <pthread.h>
 #include <stdatomic.h>
 
 #include "datum_protocol.h"
@@ -85,6 +86,12 @@ int datum_protocol_abw_assignment_notice(int len, unsigned char *data);
 int datum_protocol_abw_reveal(int len, unsigned char *data);
 
 int datum_protocol_mining_cmd(void *data, int len);
+int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data);
+bool datum_coinbaser_reply_matches(uint64_t reply_value, uint64_t reply_generation,
+	bool reply_has_echo, uint32_t reply_echo,
+	uint64_t request_value, uint64_t request_generation, uint32_t request_token);
+extern unsigned int datum_protocol_coinbaser_fetch_timeout_ms;
+extern pthread_mutex_t datum_protocol_send_buffer_lock;
 int datum_protocol_client_configure(int len, unsigned char *data);
 int datum_protocol_mining_cmd5(
 	T_DATUM_PROTOCOL_HEADER *header, unsigned char *data);

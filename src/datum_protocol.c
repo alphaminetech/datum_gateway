@@ -1225,6 +1225,28 @@ unsigned char *datum_coinbaser_v2_response = NULL;
 unsigned char datum_coinbaser_v2_response_buf_idx = 0;
 uint64_t datum_coinbaser_v2_response_value[2] = { 0, 0 };
 int datum_coinbaser_v2_response_len[2] = { 0, 0 };
+// AlphaPool release 3: the DATUM session each stored reply arrived on,
+// and the request token it echoed, if it carried one (see DATUM_COINBASER_TOKEN_*).
+static uint64_t datum_coinbaser_v2_response_generation[2] = { 0, 0 };
+static bool datum_coinbaser_v2_response_has_echo[2] = { false, false };
+static uint32_t datum_coinbaser_v2_response_echo[2] = { 0, 0 };
+// How long a fetch waits for its reply. Tests shorten it; nothing else changes it.
+unsigned int datum_protocol_coinbaser_fetch_timeout_ms = 5000;
+
+uint64_t datum_protocol_session_generation(void) {
+	return atomic_load(&datum_session_generation);
+}
+
+bool datum_coinbaser_reply_matches(uint64_t reply_value, uint64_t reply_generation,
+	bool reply_has_echo, uint32_t reply_echo,
+	uint64_t request_value, uint64_t request_generation, uint32_t request_token) {
+	// The same coinbase value is not enough to call a reply ours: a late reply to an
+	// earlier request, or one on a newer session, can carry it too.
+	if (reply_value != request_value) return false;
+	if (reply_generation != request_generation) return false;  // arrived on another session
+	if (reply_has_echo && (reply_echo != request_token)) return false; // answers another request
+	return true;
+}
 
 static int datum_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *timeout) {
 #ifndef HAVE_PTHREAD_MUTEX_TIMEDLOCK
@@ -1270,6 +1292,14 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 		return 0;
 	}
 	
+	// The session this reply arrived on (only this thread moves the generation, at the start
+	// of a connection), and the request token echo: exactly 4 bytes after the coinbaser. The
+	// echo is optional: a server that does not echo sends nothing there; bytes of any other length are ignored, as before.
+	const uint64_t generation = atomic_load(&datum_session_generation);
+	const unsigned int trailing = (unsigned int)(len - 12) - x;
+	const bool has_echo = (trailing == 4);
+	const uint32_t echo = has_echo ? upk_u32le(data, 12 + (int)x) : 0;
+	
 	rc = datum_mutex_timedlock(&datum_protocol_coinbaser_fetch_mutex, &ts);
 	if (rc != 0) {
 		DLOG_DEBUG("Could not get a lock on the coinbaser reception mutex after 5 seconds... bug?");
@@ -1286,6 +1316,9 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	memcpy(datum_coinbaser_v2_response, &data[12], x);
 	datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] = v;
 	datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx] = x;
+	datum_coinbaser_v2_response_generation[datum_coinbaser_v2_response_buf_idx] = generation;
+	datum_coinbaser_v2_response_has_echo[datum_coinbaser_v2_response_buf_idx] = has_echo;
+	datum_coinbaser_v2_response_echo[datum_coinbaser_v2_response_buf_idx] = echo;
 	
 	pthread_cond_signal(&datum_protocol_coinbaser_fetch_cond); // Signal the condition variable
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
@@ -1294,16 +1327,32 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 }
 
 int datum_protocol_coinbaser_fetch(void *sptr) {
+	return datum_protocol_coinbaser_fetch_ex(sptr, NULL);
+}
+
+int datum_protocol_coinbaser_fetch_ex(void *sptr, uint64_t *request_generation) {
 	// Called by the coinbaser thread to request a coinbase split
 	// The coinbaser thread expects this to actually result in a processed coinbase split, so we need to churn
 	// here until that's ready or times out.
+	// Returns the number of payout outputs parsed from the pool's reply (>0), 0 for a reply that carried
+	// none (or the epoch-V value case), DATUM_COINBASER_FETCH_NO_REPLY (-1) when there is NO usable reply:
+	// not connected, send failed, timed out, wait error or the session ended, and
+	// DATUM_COINBASER_FETCH_REJECTED (-2) for a reply that failed to parse (rejected whole, job untouched).
+	// AlphaPool: -1 used to be reported as 0, which the coinbaser thread could not tell
+	// from "the pool's reply carries no payout outputs".
+	// Callers must never build a coinbase from a negative result.
+	// On a count >= 0 from a reply, *request_generation (if given) is the DATUM session the request was
+	// sent on and the reply received on; the caller binds what it builds to that session.
 	T_DATUM_STRATUM_JOB *s = (T_DATUM_STRATUM_JOB *)sptr;
 	uint64_t value = s->coinbase_value;
 	unsigned char msg[128 + crypto_box_MACBYTES];
 	int i = 0, j;
 	int rc;
 	struct timespec ts;
+	unsigned char idx;
+	uint32_t token;
 	
+	if (request_generation) *request_generation = 0;
 	s->available_coinbase_outputs_count = 0;
 	
 	if (value < 31250000) { // mainnet epoch V
@@ -1318,6 +1367,15 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	memcpy(&msg[i], s->prevhash_bin, 32); i+=32;
 	msg[i] = 0xFE; i++;
 	
+	// AlphaPool release 3: a request token in the extension area after the 0xFE,
+	// which a server that does not know it ignores. A server that echoes it
+	// lets this fetch tell its own reply from a late reply to an earlier request of the same value.
+	token = randombytes_random();
+	memcpy(&msg[i], DATUM_COINBASER_TOKEN_MARKER, DATUM_COINBASER_TOKEN_MARKER_LEN); i += DATUM_COINBASER_TOKEN_MARKER_LEN;
+	msg[i] = DATUM_COINBASER_TOKEN_VERSION; i++;
+	msg[i] = 4; i++; // payload length
+	pk_u32le(msg, i, token); i += 4;
+	
 	// pad
 	j = 1 + (rand() % 80);
 	memset(&msg[i], rand(), j);
@@ -1326,9 +1384,9 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	const uint64_t session_generation =
 		atomic_load(&datum_session_generation);
 	if (datum_protocol_client_active != 3) {
-		return 0;
+		return DATUM_COINBASER_FETCH_NO_REPLY;
 	}
-	
+
 	// Hold the mutex from before the request goes out until the reply is consumed, so the
 	// receive thread cannot store and signal a reply before this thread is waiting for it.
 	// The send only appends to the outgoing buffer; it never blocks on the socket.
@@ -1338,37 +1396,57 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	if (datum_protocol_mining_cmd_for_session(
 		msg, i, session_generation) != 0) {
 		pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
-		return 0;
+		return DATUM_COINBASER_FETCH_NO_REPLY;
 	}
 	
-	// wait here for up to 5 seconds for a coinbaser response from the DATUM server
+	// wait here (5 seconds) for a coinbaser response from the DATUM server
 	clock_gettime(CLOCK_REALTIME, &ts);
-	ts.tv_sec += 5; // Set timeout to 5 seconds
+	ts.tv_sec += datum_protocol_coinbaser_fetch_timeout_ms / 1000;
+	ts.tv_nsec += (long)(datum_protocol_coinbaser_fetch_timeout_ms % 1000) * 1000000L;
+	if (ts.tv_nsec >= 1000000000L) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000L;
+	}
 
-	// Loop on the reply for this job's value: a stale reply or a spurious wakeup is not the answer.
-	while ((!datum_coinbaser_v2_response) ||
-	       (datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] != value)) {
+	// Wait for the reply to THIS request: same value, received on the session the request went
+	// out on, and echoing our token if it echoes one. A late reply to an earlier request or a
+	// spurious wakeup is not the answer.
+	while (1) {
+		if (datum_coinbaser_v2_response) {
+			idx = datum_coinbaser_v2_response_buf_idx;
+			if (datum_coinbaser_reply_matches(datum_coinbaser_v2_response_value[idx],
+				datum_coinbaser_v2_response_generation[idx], datum_coinbaser_v2_response_has_echo[idx],
+				datum_coinbaser_v2_response_echo[idx], value, session_generation, token)) {
+				break;
+			}
+			if (datum_coinbaser_v2_response_generation[idx] != session_generation) {
+				// a newer session: the one this request went out on is gone, and its reply with it
+				pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+				DLOG_WARN("DATUM session changed while waiting for a coinbaser (no coinbase is built from this)");
+				return DATUM_COINBASER_FETCH_NO_REPLY;
+			}
+		}
 		rc = pthread_cond_timedwait(&datum_protocol_coinbaser_fetch_cond, &datum_protocol_coinbaser_fetch_mutex, &ts);
 		if (rc == ETIMEDOUT) {
 			pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
-			DLOG_DEBUG("Timeout waiting for coinbaser response from DATUM server");
-			return 0;
+			DLOG_WARN("Timeout waiting for coinbaser response from DATUM server (no coinbase is built from this)");
+			return DATUM_COINBASER_FETCH_NO_REPLY;
 		}
 
 		if (rc != 0) {
 			DLOG_DEBUG("Error waiting for coinbaser response from DATUM server");
 			pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
-			return 0;
+			return DATUM_COINBASER_FETCH_NO_REPLY;
 		}
 	}
-	i = 0;
 	
-	// process received coinbase
-	if ((datum_coinbaser_v2_response) && (datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] == value)) {
-		i = datum_coinbaser_v2_parse(s, datum_coinbaser_v2_response, datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx], false);
-	}
+	// process received coinbase (the parse copies into the job only a reply it accepts whole)
+	idx = datum_coinbaser_v2_response_buf_idx;
+	i = datum_coinbaser_v2_parse(s, datum_coinbaser_v2_response, datum_coinbaser_v2_response_len[idx], false);
 	
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
+	if (i < 0) return DATUM_COINBASER_FETCH_REJECTED;
+	if (request_generation) *request_generation = session_generation;
 	return i;
 }
 

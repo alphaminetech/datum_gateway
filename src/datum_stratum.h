@@ -51,6 +51,16 @@
 
 #define MAX_COINBASE_TYPES 6
 #define DATUM_COINBASE_ID_EMPTY 0xff
+// AlphaPool: in pooled-only mode a job may reach a
+// miner ONLY with the pool's full assigned coinbase. When that is not ready yet
+// the index function returns this sentinel and send_mining_notify sends nothing.
+#define DATUM_COINBASE_ID_NONE 0xfe
+// Pooled-only: how long the gateway may go without a usable (validated and
+// published) pool coinbaser for its current work before it drops its miners
+// once so they fail over, and refuses new ones until a coinbaser is published
+// again. Measured on a gateway-level monotonic clock from the moment the
+// current work first lacked one; replacing the template does not restart it.
+#define DATUM_POOLED_ONLY_COINBASER_FAILCLOSE_MS 60000
 #define COINBASE_TYPE_TINY 0 // "empty", just pays pool
 #define COINBASE_TYPE_SMALL 1 // Nicehash needs a tiny coinb1, among other things. Max 500 bytes.
 #define COINBASE_TYPE_ANTMAIN 2 // Hack for antminer stock firmware to 750 bytes
@@ -194,6 +204,11 @@ typedef struct T_DATUM_STRATUM_JOB {
 	bool is_datum_job;
 	unsigned char datum_job_idx;
 	unsigned char datum_coinbaser_id;
+	uint64_t job_seq; // creation order of jobs (1, 2, ...); orders publications for the pooled-only outage tracker
+	uint64_t coinbaser_session_generation; // pooled-only: DATUM session the job's assignment was requested on (0 = none)
+	bool pooled_zero_outputs_logged; // pooled-only: "coinbaser carried no payout outputs" already logged for this job
+	bool pooled_withheld_logged; // pooled-only: "built coinbase failed the publication check" already logged for this job
+	bool pooled_stale_logged; // pooled-only: "assignment's session ended before publication" already logged for this job
 } T_DATUM_STRATUM_JOB;
 
 typedef struct T_DATUM_STRATUM_THREADPOOL_DATA {
@@ -290,6 +305,36 @@ bool datum_stratum_job_blake2b_commitment(T_DATUM_STRATUM_JOB *s, const T_DATUM_
 bool datum_stratum_share_is_unmasked_block(
 	const T_DATUM_STRATUM_JOB *job, const unsigned char *share_hash);
 unsigned int datum_stratum_coinbase_index(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, bool new_block);
+bool stratum_job_coinbaser_ready(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job);
+// As above with the monotonic time (ms) supplied by the caller; the pooled-only
+// fail-close uses it, solo keeps the upstream per-job wall-clock timeout.
+bool stratum_job_coinbaser_ready_at(T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job, uint64_t now_mono_ms);
+bool datum_coinbaser_local_fallback_allowed(bool protocol_active, bool pooled_only);
+int datum_coinbaser_outputs_decision(int fetched, bool pooled_only);
+// Pooled-only share acceptance: a share may only be for work the gateway can
+// actually have served, i.e. the validated COINBASE_TYPE_YUGE class of a job
+// whose coinbaser was published (never the subsidy-only or any other class).
+bool datum_stratum_pooled_share_class_allowed(const T_DATUM_STRATUM_JOB *job, bool empty_work, unsigned int coinbase_index);
+
+// Pooled-only coinbaser outage tracker (gateway-wide, monotonic ms). An outage
+// starts the first time the current work lacks a usable published coinbaser
+// and ends ONLY on a validated publication; template replacement and other
+// protocol traffic do not touch it. Jobs are identified by job_seq so a late
+// report about superseded work cannot start an outage after a publication.
+void datum_pooled_outage_note_unready(uint64_t job_seq, uint64_t now_mono_ms);
+void datum_pooled_outage_note_published(uint64_t job_seq);
+// true exactly once per outage, once it has lasted past DATUM_POOLED_ONLY_COINBASER_FAILCLOSE_MS
+bool datum_pooled_outage_kick_due(uint64_t now_mono_ms, uint64_t *outage_ms);
+// true while an outage has lasted past the bound: new miners would get no work
+bool datum_pooled_outage_reject_new_miners(uint64_t now_mono_ms);
+// The listener's admission rule for new stratum connections.
+#define DATUM_POOLED_REFUSE_NONE 0         // accept
+#define DATUM_POOLED_REFUSE_LINK_DOWN 1    // pooled-only and the DATUM link is not active (upstream rule)
+#define DATUM_POOLED_REFUSE_NO_COINBASER 2 // pooled-only, link up, but no usable coinbaser past the fail-close bound
+int datum_pooled_only_new_miner_refusal(bool pooled_only, bool link_active, uint64_t now_mono_ms);
+// when the current outage started (monotonic ms), 0 = none
+uint64_t datum_pooled_outage_since(void);
+void datum_pooled_outage_reset(void); // tests only
 void stratum_job_merkle_root_calc(T_DATUM_STRATUM_JOB *s, unsigned char *coinbase_txn_hash, unsigned char *merkle_root_output);
 int assembleBlockAndSubmit(uint8_t *block_header, uint8_t *coinbase_txn, size_t coinbase_txn_size, T_DATUM_STRATUM_JOB *job, T_DATUM_STRATUM_THREADPOOL_DATA *sdata, const char *block_hash_hex, bool empty_work, const unsigned char *extranonce);
 size_t datum_stratum_coinbase_for_block_hex(char *out, size_t out_size, const uint8_t *coinbase_txn, size_t coinbase_txn_size, bool add_witness);

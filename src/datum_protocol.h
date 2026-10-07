@@ -154,7 +154,24 @@ bool datum_protocol_is_active(void);
 bool datum_protocol_abw_required(void);
 void datum_increment_session_nonce(void *s);
 int datum_protocol_fetch_coinbaser(uint64_t value);
+// datum_protocol_coinbaser_fetch() / _ex() results other than an output count >= 0
+#define DATUM_COINBASER_FETCH_NO_REPLY (-1)  // not connected, send failed, timed out, or the session ended
+#define DATUM_COINBASER_FETCH_REJECTED (-2)  // this request's reply failed to parse and was rejected whole
 int datum_protocol_coinbaser_fetch(void *s);
+int datum_protocol_coinbaser_fetch_ex(void *s, uint64_t *request_generation);
+uint64_t datum_protocol_session_generation(void);
+
+// AlphaPool release 3: request token extension of the 0x10 coinbaser request. The legacy
+// request is 0x10 | value u64le | prevhash 32 | 0xFE (bytes 0..41). From byte 42:
+//   "DATUMRTK" (8) | version u8 (1) | payload_len u8 (4) | token u32le (4)
+// followed by 1..80 padding bytes as before. A server that does not know this extension
+// ignores it. A server that supports it
+// appends the 4 token bytes, unchanged, after the coinbaser in its 0x11 reply:
+//   value u64le | len u32le | coinbaser (len bytes) | token u32le
+// and the gateway then only consumes a reply echoing the token of the request it waits on.
+#define DATUM_COINBASER_TOKEN_MARKER "DATUMRTK"
+#define DATUM_COINBASER_TOKEN_MARKER_LEN 8
+#define DATUM_COINBASER_TOKEN_VERSION 1
 int datum_protocol_migration_request(int len, const unsigned char *data);
 bool datum_protocol_take_connect_endpoint(
 	char *host,
